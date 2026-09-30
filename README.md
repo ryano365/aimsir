@@ -38,7 +38,7 @@ On a Debian 12 / Ubuntu 22.04+ container, as root:
 
 ```bash
 apt update && apt install -y git
-git clone https://github.com/<you>/aimsir.git /opt/aimsir
+git clone https://github.com/ryano365/aimsir.git /opt/aimsir
 bash /opt/aimsir/deploy/install.sh
 nano /opt/aimsir/.env          # paste MET_API_KEY, set HOME_*
 systemctl restart aimsir

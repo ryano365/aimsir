@@ -2,7 +2,7 @@
 # Install or update Aimsir on a Debian/Ubuntu LXC (run as root).
 #
 #   First time:  apt update && apt install -y git
-#                git clone https://github.com/<you>/aimsir.git /opt/aimsir
+#                git clone https://github.com/ryano365/aimsir.git /opt/aimsir
 #                bash /opt/aimsir/deploy/install.sh
 #   Update:      bash /opt/aimsir/deploy/install.sh     (pulls the latest code first)
 set -euo pipefail
