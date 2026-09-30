@@ -64,10 +64,13 @@ def classify(h) -> str | None:
         cat, num = _get(h, "parameterCategory", -1), _get(h, "parameterNumber", -1)
         if (cat, num) in ((1, 8), (1, 52)) and lt in ("surface", "heightAboveGround", ""):
             return "tp"
-        if (cat, num) == (6, 1) and lt not in ("isobaricInhPa", "hybrid"):
+        # WMO 6/1 = total cloud; HARMONIE writes it as local 6/192 (and 6/194-196 for
+        # low/medium/high, where WMO uses 6/3-5). Met Éireann's DINI files use the local codes.
+        if (cat, num) in ((6, 1), (6, 192)) and lt not in ("isobaricInhPa",):
             return "tcc"
-        if cat == 6 and num in (3, 4, 5) and lt not in ("isobaricInhPa", "hybrid"):
-            return {3: "lcc", 4: "mcc", 5: "hcc"}[num]
+        layered = {3: "lcc", 4: "mcc", 5: "hcc", 194: "lcc", 195: "mcc", 196: "hcc"}
+        if cat == 6 and num in layered and lt not in ("isobaricInhPa", "hybrid"):
+            return layered[num]
     if sn in ("2t", "t2m") or (sn == "t" and lt == "heightAboveGround" and lev == 2):
         return "t2"
     if sn in ("10u",) or (sn == "u" and lt == "heightAboveGround" and lev == 10):
