@@ -4,6 +4,7 @@ A small self-hosted weather viewer for Ireland built on Met Éireann open data:
 
 - **Radar**: the last 2 hours of Dublin + Shannon radar, composited and looped over a map.
 - **Model**: HARMONIE-AROME NWP fields (rain, temperature, wind with arrows, cloud) and MSLP isobars, hour by hour for the latest run. Click the map to see the model's values for that spot.
+- **More layers** (tucked under a collapsible menu): radar rainfall totals for each past hour (Met's hourly Dublin+Shannon composite), plus model wind gusts, lightning, visibility/fog and lying snow.
 - **Point forecast**: current conditions, a 48-hour meteogram and a daily outlook for any location (Met's WDB point-forecast API).
 - **Warnings**: current Met Éireann warnings shown at the top of the sidebar.
 
@@ -65,6 +66,7 @@ Met documents the portal API only loosely (see *What I couldn't verify* below), 
 | Key works | `curl localhost:8080/api/status`: `error` should be `null` for both feeds |
 | Radar files are listed | `curl localhost:8080/api/debug/list/radar?hours=1` |
 | NWP files are listed | `curl localhost:8080/api/debug/list/nwp?hours=3` (summarised by name pattern; add `&full=true` for everything) |
+| Hourly radar file layout | `curl localhost:8080/api/debug/radar?kind=acc` |
 | Logs | `docker logs -f aimsir` / `journalctl -u aimsir -f` |
 
 **Model downloads.** Met's near-realtime feed holds ~3,300 files (~180 GB) at any time: every run, every lead hour, split into model-level, pressure-level and surface bundles over several domains, plus ensemble files. The app only takes `fc<run>+<lead>CONTROL_grib2_ieIoI`: the control run's surface fields cropped to the Island of Ireland, about 14 MB per hour. It fetches one run every `NWP_RUN_EVERY_HOURS` (default 3) out to `NWP_MAX_HOURS` (default 48), so about 0.7 GB every 3 hours. Set `NWP_RUN_EVERY_HOURS=1` if you want every hourly run and don't mind ~16 GB a day of downloads.
@@ -79,6 +81,7 @@ All settings are environment variables. `.env.example` lists them with comments.
 | `HOME_NAME`, `HOME_LAT`, `HOME_LON` | Dublin | Default forecast location (the browser remembers your own pick) |
 | `BASEMAP` | `openfreemap` | `openfreemap` (free vector tiles, no key), `osm` (openstreetmap.org raster) or `none` (bundled coastline only, no external requests) |
 | `RADAR_FILE_REGEX` | `T_PAGZ4[01]_.*\.h5$` | 40 = Shannon, 41 = Dublin instantaneous volumes |
+| `RADAR_ACC_REGEX`, `RADAR_ACC_HOURS` | `T_PASH21_.*\.hdf$`, `12` | Hourly radar totals: which file (21 = composite, 41 = Dublin only) and how many hours to keep |
 | `RADAR_MIN_DBZ` | `7` | Hide echoes weaker than this (≈0.1 mm/h). Raise it if you see clutter |
 | `RADAR_HISTORY_MINUTES` | `120` | Length of the radar loop |
 | `NWP_MAX_HOURS` | `48` | How far ahead to render |

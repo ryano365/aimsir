@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -21,15 +22,16 @@ from .config import settings
 from .forecast import point_forecast, warnings
 from .geo import RADAR_GRID
 from .met import MetClient, MetError
-from .palettes import RAIN
+from .palettes import RAIN, RAIN_ACC
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("aimsir")
 
 D = settings.data_dir
 RAW_RADAR, RAW_NWP = D / "raw" / "radar", D / "raw" / "nwp"
+RAW_ACC = D / "raw" / "radar_acc"
 RADAR_OUT, NWP_OUT = D / "radar", D / "nwp"
-for p in (RAW_RADAR, RAW_NWP, RADAR_OUT, NWP_OUT, settings.inbox_dir):
+for p in (RAW_RADAR, RAW_ACC, RAW_NWP, RADAR_OUT, NWP_OUT, settings.inbox_dir):
     p.mkdir(parents=True, exist_ok=True)
 
 status: dict[str, dict] = {
@@ -63,7 +65,8 @@ def _sweep_inbox() -> None:
         with open(f, "rb") as fh:
             head = fh.read(8)
         if head.startswith(b"\x89HDF"):
-            shutil.move(str(f), RAW_RADAR / f.name)
+            acc = re.search(settings.radar_acc_regex, f.name)
+            shutil.move(str(f), (RAW_ACC if acc else RAW_RADAR) / f.name)
         elif head.startswith(b"GRIB"):
             shutil.move(str(f), RAW_NWP / f.name)
 
@@ -130,22 +133,75 @@ def _render_radar() -> int:
     return len(frames)
 
 
+def _render_accum() -> int:
+    """Hourly radar rainfall totals (ODIM cartesian composite) -> acc_<stamp>.png"""
+    cutoff = _now() - timedelta(hours=settings.radar_acc_hours)
+    index = _read_json(RADAR_OUT / "acc_index.json", {"frames": []})
+    known = {fr["stamp"]: fr for fr in index.get("frames", [])}
+    frames = []
+    for f in sorted(RAW_ACC.iterdir()):
+        if f.name.startswith("."):
+            continue
+        t = radar.file_time(f.name)
+        if t is not None and t < cutoff:
+            f.unlink(missing_ok=True)
+            continue
+        stamp_guess = t.strftime("%Y%m%d%H%M") if t else None
+        if stamp_guess and stamp_guess in known and (RADAR_OUT / f"acc_{stamp_guess}.png").exists():
+            frames.append(known[stamp_guess])
+            continue
+        try:
+            c = radar.read_cartesian(f)
+        except Exception as e:  # noqa: BLE001
+            log.warning("radar accumulation %s unreadable: %s", f.name, e)
+            continue
+        t = t or c.time
+        stamp = t.strftime("%Y%m%d%H%M")
+        mm = radar.resample_cartesian(c)
+        (RADAR_OUT / f"acc_{stamp}.png").write_bytes(radar.render_accum_png(mm))
+        frames.append({"stamp": stamp, "time": t.isoformat(), "quantity": c.quantity,
+                       "projdef": c.projdef, "max": round(float(np.nanmax(mm)), 2) if np.isfinite(mm).any() else None})
+    keep = {f"acc_{fr['stamp']}.png" for fr in frames}
+    for f in RADAR_OUT.glob("acc_*.png"):
+        if f.name not in keep:
+            f.unlink(missing_ok=True)
+    frames.sort(key=lambda fr: fr["stamp"])
+    _write_json(RADAR_OUT / "acc_index.json", {"frames": frames, "updated": _now().isoformat()})
+    return len(frames)
+
+
 async def radar_loop(client: MetClient | None):
     rx = re.compile(settings.radar_file_regex)
+    rx_acc = re.compile(settings.radar_acc_regex)
     while True:
         st = status["radar"]
         st["last_poll"] = _now().isoformat()
         try:
             _sweep_inbox()
             if client:
-                since = _now() - timedelta(minutes=settings.radar_history_min)
+                since = _now() - timedelta(minutes=max(settings.radar_history_min, settings.radar_acc_hours * 60))
                 listing = await client.list("radar", since)
-                have = {p.name for p in RAW_RADAR.iterdir()}
+                recent = _now() - timedelta(minutes=settings.radar_history_min)
+                have = {p.name for p in RAW_RADAR.iterdir()} | {p.name for p in RAW_ACC.iterdir()}
                 for item in listing:
                     name = item["name"]
-                    if rx.search(name) and name not in have:
-                        await client.download("radar", name, RAW_RADAR)
+                    if name in have:
+                        continue
+                    if rx.search(name):
+                        t = radar.file_time(name)
+                        if t is None or t >= recent:
+                            await client.download("radar", name, RAW_RADAR)
+                    elif rx_acc.search(name):
+                        try:
+                            await client.download("radar", name, RAW_ACC)
+                        except (MetError, httpx.HTTPError) as e:
+                            log.warning("radar accumulation %s: %s", name, e)
             st["frames"] = await asyncio.to_thread(_render_radar)
+            try:
+                st["acc_frames"] = await asyncio.to_thread(_render_accum)
+            except Exception as e:  # noqa: BLE001 - accumulation is optional
+                log.warning("radar accumulation failed: %s", e)
+                st["acc_error"] = str(e)
             st["last_ok"], st["error"] = _now().isoformat(), None
         except Exception as e:  # noqa: BLE001
             log.exception("radar poll failed")
@@ -305,6 +361,12 @@ def radar_index():
         fr["url"] = f"/data/radar/radar_{fr['stamp']}.png"
     idx["coverage"] = "/data/radar/coverage.png" if (RADAR_OUT / "coverage.png").exists() else None
     idx.pop("coverage_sites", None)
+    acc = _read_json(RADAR_OUT / "acc_index.json", {"frames": []})
+    idx["acc"] = {
+        "legend": RAIN_ACC.legend(),
+        "frames": [{"stamp": fr["stamp"], "time": fr["time"], "url": f"/data/radar/acc_{fr['stamp']}.png"}
+                   for fr in acc.get("frames", [])],
+    }
     return idx
 
 
@@ -383,6 +445,18 @@ async def debug_list(dataset: str, hours: float = 3, full: bool = False):
     }
 
 
+@app.get("/api/debug/radar")
+def debug_radar(kind: str = "acc", name: str | None = None):
+    """ODIM attributes of the newest downloaded radar file (kind=acc or volume)."""
+    folder = RAW_ACC if kind == "acc" else RAW_RADAR
+    files = sorted(p for p in folder.iterdir() if p.is_file() and not p.name.startswith("."))
+    if name:
+        files = [p for p in files if p.name == name]
+    if not files:
+        raise HTTPException(404, "no radar files of that kind downloaded yet")
+    return {"file": files[-1].name, "attributes": radar.odim_summary(files[-1])}
+
+
 @app.get("/api/debug/grib")
 def debug_grib(name: str | None = None, limit: int = 400):
     """Inventory of one downloaded NWP file: which parameters/levels it holds."""
@@ -398,6 +472,7 @@ def debug_grib(name: str | None = None, limit: int = 400):
 async def reprocess():
     _sweep_inbox()
     await asyncio.to_thread(_render_radar)
+    await asyncio.to_thread(_render_accum)
     run = await asyncio.to_thread(_process_nwp, True)
     return {"radar": "ok", "nwp_run": run}
 

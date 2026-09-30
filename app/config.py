@@ -53,6 +53,9 @@ class Settings:
     radar_history_min: int = field(default_factory=lambda: _int("RADAR_HISTORY_MINUTES", 120))
     # Instantaneous volume scans: 40 = Shannon, 41 = Dublin
     radar_file_regex: str = field(default_factory=lambda: _env("RADAR_FILE_REGEX", r"T_PAGZ4[01]_.*\.h5$"))
+    # Hourly radar rainfall accumulation: T_PASH21 = Dublin+Shannon composite (T_PASH41 = Dublin only)
+    radar_acc_regex: str = field(default_factory=lambda: _env("RADAR_ACC_REGEX", r"T_PASH21_.*\.hdf$"))
+    radar_acc_hours: int = field(default_factory=lambda: _int("RADAR_ACC_HOURS", 12))
     radar_min_dbz: float = field(default_factory=lambda: _float("RADAR_MIN_DBZ", 7.0))
 
     # NWP (HARMONIE-AROME GRIB)

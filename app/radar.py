@@ -190,3 +190,121 @@ def render_coverage_png(mask: np.ndarray) -> bytes:
 
 def slot_of(t: datetime) -> datetime:
     return t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)
+
+
+# ---------------------------------------------------------------- cartesian products (hourly accumulation)
+
+@dataclass
+class Cartesian:
+    time: datetime
+    values: np.ndarray       # (ysize, xsize), NaN = no data
+    quantity: str
+    projdef: str
+    corners: dict            # UL/UR/LL/LR lat/lon
+    xscale: float
+    yscale: float
+
+
+def read_cartesian(src: str | Path | bytes) -> Cartesian:
+    """ODIM COMP/IMAGE product, e.g. Met's T_PASH21 hourly accumulation composite."""
+    fh = h5py.File(io.BytesIO(src) if isinstance(src, bytes) else src, "r")
+    with fh as f:
+        what, where = f.get("what"), f.get("where")
+        obj = str(_attr(what, "object", "")).upper()
+        if obj in ("PVOL", "SCAN"):
+            raise ValueError("polar product, not cartesian")
+        ds_name = sorted(k for k in f.keys() if k.startswith("dataset"))[0]
+        ds = f[ds_name]
+        ds_what, ds_where = ds.get("what"), ds.get("where")
+        where = ds_where if ds_where is not None and "xsize" in ds_where.attrs else where
+        d_name = sorted(k for k in ds.keys() if k.startswith("data"))[0]
+        d = ds[d_name]
+        d_what = d.get("what")
+
+        def pick(name, default=None):
+            v = _attr(d_what, name)
+            return _attr(ds_what, name, default) if v is None else v
+
+        raw = d["data"][()]
+        gain, offset = float(pick("gain", 1.0)), float(pick("offset", 0.0))
+        vals = raw.astype(np.float32) * gain + offset
+        nodata, undetect = pick("nodata"), pick("undetect")
+        if nodata is not None:
+            vals[raw == nodata] = np.nan
+        if undetect is not None:
+            vals[raw == undetect] = 0.0   # "measured, nothing there" -> zero rain
+        corners = {k: float(_attr(where, k)) for k in
+                   ("UL_lat", "UL_lon", "UR_lat", "UR_lon", "LL_lat", "LL_lon", "LR_lat", "LR_lon")
+                   if _attr(where, k) is not None}
+        t = (_odim_time(_attr(ds_what, "enddate"), _attr(ds_what, "endtime"))
+             or _odim_time(_attr(what, "date"), _attr(what, "time")) or datetime.now(timezone.utc))
+        return Cartesian(time=t, values=vals, quantity=str(pick("quantity", "")).upper(),
+                         projdef=str(_attr(where, "projdef", "")), corners=corners,
+                         xscale=float(_attr(where, "xscale", 1.0)), yscale=float(_attr(where, "yscale", 1.0)))
+
+
+def _cart_lookup(c: Cartesian, grid: MercGrid):
+    from .proj import forward
+
+    lat2d, lon2d = grid.mesh
+    h, w = c.values.shape
+    fwd = forward(c.projdef) if c.projdef else None
+    cn = c.corners
+    if fwd is not None and all(f"{k}_lat" in cn for k in ("UL", "UR", "LL", "LR")):
+        # Fit projected corner positions to pixel edges. This absorbs the small
+        # sphere-vs-ellipsoid error of our projection maths (~0.1 px vs pyproj).
+        src = np.array([fwd(cn[f"{k}_lat"], cn[f"{k}_lon"]) for k in ("UL", "UR", "LL", "LR")], dtype=float)
+        dst = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=float)
+        coef, *_ = np.linalg.lstsq(np.c_[src, np.ones(4)], dst, rcond=None)
+        x, y = fwd(lat2d, lon2d)
+        col = np.floor(x * coef[0, 0] + y * coef[1, 0] + coef[2, 0]).astype(np.int64)
+        row = np.floor(x * coef[0, 1] + y * coef[1, 1] + coef[2, 1]).astype(np.int64)
+    elif fwd is not None and "UL_lat" in cn:
+        x0, y0 = fwd(cn["UL_lat"], cn["UL_lon"])
+        x, y = fwd(lat2d, lon2d)
+        col = np.floor((x - x0) / c.xscale).astype(np.int64)
+        row = np.floor((y0 - y) / c.yscale).astype(np.int64)
+    else:  # unknown projection: interpolate linearly between the corners
+        log.warning("radar product projection %r not supported, using corner interpolation", c.projdef)
+        col = np.floor((lon2d - cn["UL_lon"]) / (cn["UR_lon"] - cn["UL_lon"]) * w).astype(np.int64)
+        row = np.floor((cn["UL_lat"] - lat2d) / (cn["UL_lat"] - cn["LL_lat"]) * h).astype(np.int64)
+    inside = (col >= 0) & (col < w) & (row >= 0) & (row < h)
+    return np.clip(row, 0, h - 1), np.clip(col, 0, w - 1), inside
+
+
+def resample_cartesian(c: Cartesian, grid: MercGrid = RADAR_GRID) -> np.ndarray:
+    row, col, inside = _cart_lookup(c, grid)
+    out = c.values[row, col]
+    out[~inside] = np.nan
+    if c.quantity in REFLECTIVITY:  # accumulation given as reflectivity: convert to mm/h
+        out = dbz_to_rate(out)
+    return out
+
+
+def render_accum_png(mm: np.ndarray) -> bytes:
+    from .palettes import RAIN_ACC
+
+    buf = io.BytesIO()
+    Image.fromarray(RAIN_ACC.colorize(mm), "RGBA").save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def odim_summary(path: Path) -> dict:
+    """Attributes of an ODIM file (debugging)."""
+    out: dict = {}
+    with h5py.File(path, "r") as f:
+        def visit(name, obj):
+            if len(out) > 60:
+                return
+            attrs = {k: (v.decode() if isinstance(v, bytes) else (v.tolist() if hasattr(v, "tolist") else v))
+                     for k, v in obj.attrs.items()}
+            entry = attrs
+            if isinstance(obj, h5py.Dataset):
+                entry = {"shape": list(obj.shape), "dtype": str(obj.dtype), **attrs}
+            if entry:
+                out[name] = entry
+        for k in ("what", "where", "how"):
+            if k in f:
+                visit(k, f[k])
+        f.visititems(visit)
+    return out

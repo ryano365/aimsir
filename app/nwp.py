@@ -22,12 +22,13 @@ from scipy.spatial import cKDTree
 import eccodes as ec
 
 from .geo import NWP_GRID, MercGrid, to_xyz
-from .palettes import CLOUD, RAIN, TEMP, WIND
+from .palettes import CLOUD, GUST, LIGHTNING, RAIN, SNOW, TEMP, VIS, WIND
 
 log = logging.getLogger(__name__)
 
 FIELDS = ("t2", "u10", "v10", "msl", "tp", "tcc")
 CLOUD_LAYERS = ("lcc", "mcc", "hcc")  # used to build total cloud when tcc is absent
+EXTRA_FIELDS = ("gust", "gu", "gv", "vis", "sd", "ltg")  # optional layers
 
 
 def _get(h, key, default=None):
@@ -68,6 +69,14 @@ def classify(h) -> str | None:
         # low/medium/high, where WMO uses 6/3-5). Met Éireann's DINI files use the local codes.
         if (cat, num) in ((6, 1), (6, 192)) and lt not in ("isobaricInhPa",):
             return "tcc"
+        if (cat, num) == (17, 192):          # HARMONIE lightning (local)
+            return "ltg"
+        if (cat, num) == (19, 0) and lt not in ("isobaricInhPa",):
+            return "vis"
+        if (cat, num) == (2, 22) and lt not in ("isobaricInhPa", "hybrid"):
+            return "gust"
+        if (cat, num) in ((2, 23), (2, 24)) and lt not in ("isobaricInhPa", "hybrid"):
+            return "gu" if num == 23 else "gv"
         layered = {3: "lcc", 4: "mcc", 5: "hcc", 194: "lcc", 195: "mcc", 196: "hcc"}
         if cat == 6 and num in layered and lt not in ("isobaricInhPa", "hybrid"):
             return layered[num]
@@ -85,6 +94,18 @@ def classify(h) -> str | None:
         return "tcc"
     if sn in CLOUD_LAYERS and lt not in ("isobaricInhPa", "hybrid"):
         return sn
+    if sn in ("max_10efg", "10efg"):
+        return "gu"
+    if sn in ("max_10nfg", "10nfg"):
+        return "gv"
+    if sn in ("10fg", "fg10", "max_10fg", "i10fg", "gust"):
+        return "gust"
+    if sn == "vis":
+        return "vis"
+    if sn in ("sd", "sde", "sdwe") and lt not in ("isobaricInhPa", "hybrid"):
+        return "sd"
+    if sn in ("lgt", "ltng", "litoti"):
+        return "ltg"
     return None
 
 
@@ -277,6 +298,10 @@ LAYERS = {
     "temp": {"scale": TEMP},
     "wind": {"scale": WIND},
     "cloud": {"scale": CLOUD},
+    "gust": {"scale": GUST},
+    "vis": {"scale": VIS},
+    "snow": {"scale": SNOW},
+    "lightning": {"scale": LIGHTNING},
 }
 INSPECT_STEP = 3  # decimation for the click-to-inspect value store
 
@@ -311,6 +336,7 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
     regridders: dict[tuple, Regridder] = {}
     prev_tp: tuple[datetime, np.ndarray] | None = None
     frames = []
+    ranges: dict[str, list[float]] = {}
     for t in times:
         fields = by_time[t]
         vals: dict[str, np.ndarray] = {}
@@ -355,6 +381,21 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
             elif name in CLOUD_LAYERS:
                 c = rg(raw * 100.0 if np.nanmax(raw) <= 1.01 else raw)
                 vals["_layers"] = c if "_layers" not in vals else np.fmax(vals["_layers"], c)
+            elif name == "gust":
+                vals["gust"] = rg(raw) * 3.6
+            elif name in ("gu", "gv"):
+                vals[name] = rg(raw)          # speed only, so grid rotation doesn't matter
+            elif name == "vis":
+                vals["vis"] = rg(raw / 1000.0 if np.nanmax(raw) > 200 else raw)   # m -> km
+            elif name == "sd":
+                # snow water equivalent: kg m-2 == mm; metres of water -> mm
+                vals["snow"] = rg(raw * 1000.0 if ref.units.strip() == "m" else raw)
+            elif name == "ltg":
+                vals["lightning"] = rg(raw)
+        if "gust" not in vals and "gu" in vals and "gv" in vals:
+            vals["gust"] = np.hypot(vals["gu"], vals["gv"]) * 3.6
+        vals.pop("gu", None)
+        vals.pop("gv", None)
         if "cloud" not in vals and "_layers" in vals:
             vals["cloud"] = vals["_layers"]  # maximum-overlap estimate of total cloud
         vals.pop("_layers", None)
@@ -371,7 +412,7 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
 
         stamp = t.strftime("%Y%m%d%H%M")
         layers = []
-        for key in ("rain", "temp", "cloud"):
+        for key in ("rain", "temp", "cloud", "gust", "vis", "snow", "lightning"):
             if key in vals:
                 (run_dir / f"{key}_{stamp}.png").write_bytes(_png(LAYERS[key]["scale"].colorize(vals[key])))
                 layers.append(key)
@@ -382,7 +423,13 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
             (run_dir / f"msl_{stamp}.json").write_text(json.dumps(isobars(vals["msl"], grid)))
             layers.append("msl")
         store = {k: vals[k][::INSPECT_STEP, ::INSPECT_STEP].astype(np.float16)
-                 for k in ("rain", "temp", "cloud", "wind", "wind_dir", "msl") if k in vals}
+                 for k in ("rain", "temp", "cloud", "wind", "wind_dir", "msl", "gust", "vis", "snow", "lightning")
+                 if k in vals}
+        for k in ("gust", "vis", "snow", "lightning"):   # value ranges, handy for tuning scales
+            if k in vals and np.isfinite(vals[k]).any():
+                lo, hi = float(np.nanmin(vals[k])), float(np.nanmax(vals[k]))
+                r = ranges.setdefault(k, [lo, hi])
+                r[0], r[1] = min(r[0], lo), max(r[1], hi)
         if store:
             np.savez_compressed(run_dir / f"values_{stamp}.npz", **store)
         if layers:
@@ -394,6 +441,7 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
         "bounds": grid.bounds,
         "frames": frames,
         "legends": {k: v["scale"].legend() for k, v in LAYERS.items()},
+        "ranges": {k: [round(v[0], 4), round(v[1], 4)] for k, v in ranges.items()},
         "generated": datetime.now(timezone.utc).isoformat(),
     }
     (run_dir / "index.json").write_text(json.dumps(index))

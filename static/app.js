@@ -54,7 +54,7 @@
   let coastAlways = false;
   const syncCoast = () => {
     if (!coast) return;
-    const want = coastAlways || S.mode !== "radar";
+    const want = coastAlways || !isRadar(S.mode);
     if (want && !map.hasLayer(coast)) coast.addTo(map);
     if (!want && map.hasLayer(coast)) map.removeLayer(coast);
   };
@@ -127,18 +127,26 @@
     place: store.get("place", null), homePin: null, status: null,
   };
 
+  const RADAR_MODES = ["radar", "radaracc"];
+  const isRadar = (m) => RADAR_MODES.includes(m);
+  const MORE_MODES = ["radaracc", "gust", "lightning", "vis", "snow"];
+
   // ------------------------------------------------------------ frames / overlays
   function framesFor(mode) {
     if (mode === "radar") {
       const r = S.radar;
       return r ? r.frames.map((f) => ({ t: new Date(f.time), url: f.url, stamp: f.stamp })) : [];
     }
+    if (mode === "radaracc") {
+      const a = S.radar?.acc;
+      return a ? a.frames.map((f) => ({ t: new Date(f.time), url: f.url, stamp: f.stamp })) : [];
+    }
     const n = S.nwp;
     if (!n || !n.frames) return [];
     return n.frames.filter((f) => f.layers.includes(mode))
       .map((f) => ({ t: new Date(f.valid), url: `${n.base}${mode}_${f.stamp}.png`, stamp: f.stamp }));
   }
-  const boundsFor = (mode) => (mode === "radar" ? S.radar?.bounds : S.nwp?.bounds);
+  const boundsFor = (mode) => (isRadar(mode) ? S.radar?.bounds : S.nwp?.bounds);
 
   function clearOverlays() {
     for (const ov of S.overlays.values()) map.removeLayer(ov);
@@ -165,7 +173,7 @@
   function show(i) {
     if (!S.frames.length) return;
     S.i = Math.max(0, Math.min(S.frames.length - 1, i));
-    S.followLatest = S.mode === "radar" && S.i === S.frames.length - 1;
+    S.followLatest = isRadar(S.mode) && S.i === S.frames.length - 1;
     const f = S.frames[S.i];
     S.want = f.url;
     const ov = overlay(f.url);
@@ -211,7 +219,8 @@
 
   function drawClock(t) {
     const today = dayKey(new Date()) === dayKey(t);
-    $("#t-day").textContent = `${today ? "Today" : fDate.format(t)} · ${S.mode === "radar" ? "radar" : "model"}`;
+    const kind = S.mode === "radar" ? "radar" : S.mode === "radaracc" ? "radar total" : "model";
+    $("#t-day").textContent = `${today ? "Today" : fDate.format(t)} · ${kind}`;
     $("#t-time").textContent = hm(t);
     $(".clock").classList.toggle("future", t.getTime() > Date.now() + 5 * 60e3);
   }
@@ -285,9 +294,12 @@
   }
   document.querySelectorAll("input[name=layer]").forEach((r) =>
     r.addEventListener("change", () => setMode(r.value, true)));
+  const more = $("#more");
+  more.open = store.get("moreOpen", false) || MORE_MODES.includes(S.mode);
+  more.addEventListener("toggle", () => store.set("moreOpen", more.open));
 
   function drawLegend() {
-    const lg = S.mode === "radar" ? S.radar?.legend : S.nwp?.legends?.[S.mode];
+    const lg = S.mode === "radar" ? S.radar?.legend : S.mode === "radaracc" ? S.radar?.acc?.legend : S.nwp?.legends?.[S.mode];
     const el = $("#legend");
     if (!lg || !S.frames.length) { el.innerHTML = ""; return; }
     const steps = lg.steps;
@@ -296,19 +308,23 @@
     el.innerHTML =
       `<div class="ttl">${esc(lg.label)} · ${esc(lg.unit)}</div>` +
       `<div class="ramp">${steps.map((s) => `<span style="background:${s.colour}"></span>`).join("")}</div>` +
-      `<div class="lbls">${steps.map((s, k) => `<span>${(k === 0 && lg.key === "temp") || (steps.length > 12 && k % 2) ? "" : lbl(s.from)}</span>`).join("")}</div>`;
+      `<div class="lbls">${steps.map((s, k) => `<span>${(k === 0 && lg.key === "temp") || (steps.length > 12 && k % 2) ? "" : lbl(s.from)}</span>`).join("")}${lg.above != null ? `<span>${lbl(lg.above)}+</span>` : ""}</div>`;
   }
 
   function emptyState() {
     const el = $("#empty");
     if (S.frames.length) { el.hidden = true; return; }
-    const st = S.status?.[S.mode === "radar" ? "radar" : "nwp"] || {};
+    const st = S.status?.[isRadar(S.mode) ? "radar" : "nwp"] || {};
     let msg;
     if (!S.cfg?.has_key) {
       msg = `<b>No API key configured</b>Set <code>MET_API_KEY</code> (from your profile on opendata.met.ie) and restart, or drop radar/GRIB files into the inbox folder.`;
     } else if (st.error) {
-      msg = `<b>${S.mode === "radar" ? "Radar" : "Model"} data unavailable</b>${esc(st.error)}`;
-    } else if (S.mode !== "radar" && (st.busy || S.nwp?.busy)) {
+      msg = `<b>${isRadar(S.mode) ? "Radar" : "Model"} data unavailable</b>${esc(st.error)}`;
+    } else if (S.mode === "radaracc") {
+      msg = `<b>No hourly radar totals yet</b>${st.acc_error ? esc(st.acc_error) : "Met publishes these once an hour; the first one should appear within the hour."}`;
+    } else if (!isRadar(S.mode) && S.nwp?.frames?.length) {
+      msg = `<b>Not in this model run</b>This field wasn't found in the downloaded model files.`;
+    } else if (!isRadar(S.mode) && (st.busy || S.nwp?.busy)) {
       msg = `<b>Processing model run…</b>The newest HARMONIE run is being decoded. This can take a few minutes.`;
     } else {
       msg = `<b>Waiting for data</b>Nothing has been downloaded yet. The first files usually arrive within a few minutes.`;
@@ -383,6 +399,10 @@
         ["Wind", v.wind != null && `${compass(v.wind_dir)} ${Math.round(v.wind)} km/h`],
         ["Cloud", v.cloud != null && `${Math.round(v.cloud)} %`],
         ["MSLP", v.msl != null && `${Math.round(v.msl)} hPa`],
+        ["Gusts", v.gust != null && `${Math.round(v.gust)} km/h`],
+        ["Visibility", v.vis != null && (v.vis >= 10 ? "10 km+" : `${v.vis < 1 ? Math.round(v.vis * 1000) + " m" : v.vis.toFixed(1) + " km"}`)],
+        ["Snow", v.snow != null && v.snow >= 0.5 && `${v.snow.toFixed(0)} mm w.e.`],
+        ["Lightning", v.lightning != null && v.lightning >= 0.01 && v.lightning.toFixed(2)],
       ].filter((r) => r[1]);
       pop.setContent(`<div class="pop">${head}<table>${rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>` +
         `<h3 style="margin:6px 0 0">model · ${fDate.format(new Date(best.valid))} ${hm(new Date(best.valid))}</h3>${btn}</div>`);
@@ -560,7 +580,9 @@
     $("#status").innerHTML = bits.join(" · ") + (err ? `<br><span class="bad" title="${esc(S.status?.radar?.error || S.status?.nwp?.error || "")}">${err}</span>` : "");
     document.querySelectorAll("input[name=layer]").forEach((r) => {
       if (r.value === "radar") return;
-      r.closest("label").classList.toggle("off", !S.nwp?.frames?.some((f) => f.layers.includes(r.value)));
+      const has = r.value === "radaracc" ? !!S.radar?.acc?.frames?.length
+        : !!S.nwp?.frames?.some((f) => f.layers.includes(r.value));
+      r.closest("label").classList.toggle("off", !has);
     });
   }
 
@@ -568,15 +590,16 @@
   async function refreshRadar() {
     try {
       const r = await getJSON("/api/radar");
-      const changed = JSON.stringify(r.frames.map((f) => f.stamp)) !== JSON.stringify(S.radar?.frames?.map((f) => f.stamp));
+      const sig = (x) => JSON.stringify([x?.frames?.map((f) => f.stamp), x?.acc?.frames?.map((f) => f.stamp)]);
+      const changed = sig(r) !== sig(S.radar);
       S.radar = r;
       if (r.coverage && !S.coverage) {
         S.coverage = L.imageOverlay(r.coverage + "?v=" + Date.now(), r.bounds, { interactive: false, opacity: S.mode === "radar" ? 1 : 0 }).addTo(map);
       }
-      if (changed && S.booted && S.mode === "radar") {
+      if (changed && S.booted && isRadar(S.mode)) {
         const follow = S.followLatest || !S.frames.length;
         const cur = S.frames[S.i]?.stamp;
-        S.frames = framesFor("radar");
+        S.frames = framesFor(S.mode);
         drawTicks();
         drawLegend();
         emptyState();
@@ -617,7 +640,9 @@
     if (!S.place) S.place = { name: S.cfg.home.name, lat: S.cfg.home.lat, lon: S.cfg.home.lon, custom: !PLACES.some((p) => p[0] === S.cfg.home.name) };
     setPlace(S.place);
     await Promise.all([refreshStatus(), refreshRadar(), refreshNwp()]);
-    const initial = S.mode !== "radar" && !(S.nwp?.frames || []).some((f) => f.layers.includes(S.mode)) ? "radar" : S.mode;
+    const avail = (m) => m === "radar" || (m === "radaracc" ? !!S.radar?.acc?.frames?.length
+      : (S.nwp?.frames || []).some((f) => f.layers.includes(m)));
+    const initial = avail(S.mode) ? S.mode : "radar";
     S.booted = true;
     setMode(initial, false);
     loadWarnings();
