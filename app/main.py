@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import shutil
 import time
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,10 +19,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import nwp, radar
+from . import nwp, radar, tiles
+from .grids import bilinear
 from .config import settings
 from .forecast import point_forecast, warnings
-from .geo import RADAR_GRID
 from .met import MetClient, MetError
 from .palettes import RAIN, RAIN_ACC
 
@@ -31,7 +33,7 @@ D = settings.data_dir
 RAW_RADAR, RAW_NWP = D / "raw" / "radar", D / "raw" / "nwp"
 RAW_ACC = D / "raw" / "radar_acc"
 RADAR_OUT, NWP_OUT = D / "radar", D / "nwp"
-for p in (RAW_RADAR, RAW_ACC, RAW_NWP, RADAR_OUT, NWP_OUT, settings.inbox_dir):
+for p in (RAW_RADAR, RAW_ACC, RAW_NWP, RADAR_OUT, NWP_OUT, settings.inbox_dir, D / "tiles"):
     p.mkdir(parents=True, exist_ok=True)
 
 status: dict[str, dict] = {
@@ -73,7 +75,13 @@ def _sweep_inbox() -> None:
 
 # ------------------------------------------------------------------ radar
 
+RADAR_FRAMES, ACC_FRAMES = RADAR_OUT / "frames", RADAR_OUT / "acc"
+TILE_CACHE = D / "tiles"
+
+
 def _render_radar() -> int:
+    """Decode each 5-minute slot's volume scans and store the lowest sweeps; the map
+    tiles are drawn from these on request."""
     cutoff = _now() - timedelta(minutes=settings.radar_history_min)
     slots: dict[datetime, list[Path]] = {}
     for f in RAW_RADAR.iterdir():
@@ -94,14 +102,16 @@ def _render_radar() -> int:
     index = _read_json(RADAR_OUT / "index.json", {"frames": []})
     known = {fr["stamp"]: fr for fr in index.get("frames", [])}
     frames = []
-    sites_seen: dict[str, radar.Sweep] = {}
+    sites: dict[str, dict] = {}
     for slot in sorted(slots):
         files = sorted(p.name for p in slots[slot])
         stamp = slot.strftime("%Y%m%d%H%M")
-        png = RADAR_OUT / f"radar_{stamp}.png"
+        fdir = RADAR_FRAMES / stamp
         prev = known.get(stamp)
-        if prev and prev.get("files") == files and png.exists():
+        if prev and prev.get("files") == files and (fdir / "meta.json").exists():
             frames.append(prev)
+            for m in _read_json(fdir / "meta.json", []):
+                sites[f"{m['lat']:.3f},{m['lon']:.3f}"] = m
             continue
         sweeps = []
         for p in slots[slot]:
@@ -111,30 +121,41 @@ def _render_radar() -> int:
                 log.warning("radar %s unreadable: %s", p.name, e)
         if not sweeps:
             continue
-        for s in sweeps:
-            sites_seen[f"{s.lat:.3f},{s.lon:.3f}"] = s
-        png.write_bytes(radar.render_png(radar.composite(sweeps), settings.radar_min_dbz))
-        frames.append({"stamp": stamp, "time": slot.isoformat(), "files": files,
-                       "sites": len(sweeps)})
-    # coverage overlay, rebuilt when the set of radar sites changes
-    if sites_seen:
-        key = sorted(sites_seen)
-        if index.get("coverage_sites") != key or not (RADAR_OUT / "coverage.png").exists():
-            (RADAR_OUT / "coverage.png").write_bytes(
-                radar.render_coverage_png(radar.coverage_mask(list(sites_seen.values()))))
-            index["coverage_sites"] = key
-    keep = {f"radar_{fr['stamp']}.png" for fr in frames}
-    for f in RADAR_OUT.glob("radar_*.png"):
-        if f.name not in keep:
-            f.unlink(missing_ok=True)
-    index.update({"frames": frames, "bounds": RADAR_GRID.bounds, "legend": RAIN.legend(),
-                  "updated": _now().isoformat()})
+        if fdir.exists():
+            shutil.rmtree(fdir, ignore_errors=True)
+            shutil.rmtree(TILE_CACHE / "radar" / stamp, ignore_errors=True)
+        fdir.mkdir(parents=True, exist_ok=True)
+        metas = []
+        for k, sw in enumerate(sweeps):
+            np.save(fdir / f"s{k}.npy", sw.dbz.astype(np.float16))
+            m = radar.site_meta(sw)
+            metas.append(m)
+            sites[f"{m['lat']:.3f},{m['lon']:.3f}"] = m
+        _write_json(fdir / "meta.json", metas)
+        frames.append({"stamp": stamp, "time": slot.isoformat(), "files": files, "sites": len(sweeps)})
+    keep = {fr["stamp"] for fr in frames}
+    for d in (RADAR_FRAMES.iterdir() if RADAR_FRAMES.exists() else []):
+        if d.name not in keep:
+            shutil.rmtree(d, ignore_errors=True)
+            shutil.rmtree(TILE_CACHE / "radar" / d.name, ignore_errors=True)
+    for f in RADAR_OUT.glob("*.png"):  # images from the pre-tile version
+        f.unlink(missing_ok=True)
+    site_list = [sites[k] for k in sorted(sites)]
+    cov_key = hashlib.sha1(json.dumps(site_list, sort_keys=True).encode()).hexdigest()[:10] if site_list else None
+    if cov_key and index.get("coverage_key") != cov_key:
+        shutil.rmtree(TILE_CACHE / "coverage", ignore_errors=True)
+    bbox = None
+    if site_list:
+        bbs = [radar.site_bbox(m) for m in site_list]
+        bbox = [min(b[0] for b in bbs), min(b[1] for b in bbs), max(b[2] for b in bbs), max(b[3] for b in bbs)]
+    index.update({"frames": frames, "sites": site_list, "coverage_key": cov_key, "bbox": bbox,
+                  "legend": RAIN.legend(), "updated": _now().isoformat()})
     _write_json(RADAR_OUT / "index.json", index)
     return len(frames)
 
 
 def _render_accum() -> int:
-    """Hourly radar rainfall totals (ODIM cartesian composite) -> acc_<stamp>.png"""
+    """Hourly radar rainfall totals (ODIM cartesian composite), stored for tiling."""
     cutoff = _now() - timedelta(hours=settings.radar_acc_hours)
     index = _read_json(RADAR_OUT / "acc_index.json", {"frames": []})
     known = {fr["stamp"]: fr for fr in index.get("frames", [])}
@@ -147,7 +168,7 @@ def _render_accum() -> int:
             f.unlink(missing_ok=True)
             continue
         stamp_guess = t.strftime("%Y%m%d%H%M") if t else None
-        if stamp_guess and stamp_guess in known and (RADAR_OUT / f"acc_{stamp_guess}.png").exists():
+        if stamp_guess and stamp_guess in known and (ACC_FRAMES / stamp_guess / "values.npy").exists():
             frames.append(known[stamp_guess])
             continue
         try:
@@ -157,14 +178,21 @@ def _render_accum() -> int:
             continue
         t = t or c.time
         stamp = t.strftime("%Y%m%d%H%M")
-        mm = radar.resample_cartesian(c)
-        (RADAR_OUT / f"acc_{stamp}.png").write_bytes(radar.render_accum_png(mm))
-        frames.append({"stamp": stamp, "time": t.isoformat(), "quantity": c.quantity,
-                       "projdef": c.projdef, "max": round(float(np.nanmax(mm)), 2) if np.isfinite(mm).any() else None})
-    keep = {f"acc_{fr['stamp']}.png" for fr in frames}
-    for f in RADAR_OUT.glob("acc_*.png"):
-        if f.name not in keep:
-            f.unlink(missing_ok=True)
+        vals = radar.dbz_to_rate(c.values) if c.quantity in radar.REFLECTIVITY else c.values
+        mapping = radar.cart_mapping(c)
+        mapping["bbox"] = radar.cart_bbox(mapping, c.corners)
+        adir = ACC_FRAMES / stamp
+        shutil.rmtree(TILE_CACHE / "radaracc" / stamp, ignore_errors=True)
+        adir.mkdir(parents=True, exist_ok=True)
+        np.save(adir / "values.npy", vals.astype(np.float16))
+        _write_json(adir / "mapping.json", mapping)
+        frames.append({"stamp": stamp, "time": t.isoformat(), "quantity": c.quantity, "projdef": c.projdef,
+                       "max": round(float(np.nanmax(vals)), 2) if np.isfinite(vals).any() else None})
+    keep = {fr["stamp"] for fr in frames}
+    for d in (ACC_FRAMES.iterdir() if ACC_FRAMES.exists() else []):
+        if d.name not in keep:
+            shutil.rmtree(d, ignore_errors=True)
+            shutil.rmtree(TILE_CACHE / "radaracc" / d.name, ignore_errors=True)
     frames.sort(key=lambda fr: fr["stamp"])
     _write_json(RADAR_OUT / "acc_index.json", {"frames": frames, "updated": _now().isoformat()})
     return len(frames)
@@ -355,19 +383,113 @@ def get_status():
 
 @app.get("/api/radar")
 def radar_index():
-    idx = _read_json(RADAR_OUT / "index.json", {"frames": [], "bounds": RADAR_GRID.bounds, "legend": RAIN.legend()})
-    for fr in idx["frames"]:
-        fr.pop("files", None)
-        fr["url"] = f"/data/radar/radar_{fr['stamp']}.png"
-    idx["coverage"] = "/data/radar/coverage.png" if (RADAR_OUT / "coverage.png").exists() else None
-    idx.pop("coverage_sites", None)
+    idx = _read_json(RADAR_OUT / "index.json", {"frames": [], "legend": RAIN.legend()})
+    frames = [{"stamp": fr["stamp"], "time": fr["time"], "sites": fr.get("sites")} for fr in idx.get("frames", [])]
     acc = _read_json(RADAR_OUT / "acc_index.json", {"frames": []})
-    idx["acc"] = {
-        "legend": RAIN_ACC.legend(),
-        "frames": [{"stamp": fr["stamp"], "time": fr["time"], "url": f"/data/radar/acc_{fr['stamp']}.png"}
-                   for fr in acc.get("frames", [])],
+    return {
+        "frames": frames,
+        "legend": idx.get("legend", RAIN.legend()),
+        "bbox": idx.get("bbox"),
+        "tiles": "/tiles/radar/{stamp}/{z}/{x}/{y}.png",
+        "coverage": f"/tiles/coverage/{idx['coverage_key']}/{{z}}/{{x}}/{{y}}.png" if idx.get("coverage_key") else None,
+        "acc": {
+            "legend": RAIN_ACC.legend(),
+            "tiles": "/tiles/radaracc/{stamp}/{z}/{x}/{y}.png",
+            "frames": [{"stamp": fr["stamp"], "time": fr["time"]} for fr in acc.get("frames", [])],
+        },
     }
-    return idx
+
+
+# ------------------------------------------------------------------ tiles
+
+@lru_cache(maxsize=64)
+def _radar_frame(stamp: str, mtime: float):
+    fdir = RADAR_FRAMES / stamp
+    metas = _read_json(fdir / "meta.json", [])
+    return [(np.load(fdir / f"s{k}.npy").astype(np.float32), m) for k, m in enumerate(metas)]
+
+
+def _png(data: bytes) -> Response:
+    return Response(data, media_type="image/png", headers={"Cache-Control": "public, max-age=604800, immutable"})
+
+
+def _tile_args_ok(z: int, x: int, y: int) -> bool:
+    return 3 <= z <= 14 and 0 <= x < 2 ** z and 0 <= y < 2 ** z
+
+
+@app.get("/tiles/radar/{stamp}/{z}/{x}/{y}.png")
+def radar_tile(stamp: str, z: int, x: int, y: int):
+    fdir = RADAR_FRAMES / stamp
+    if not re.fullmatch(r"\d{12}", stamp) or not _tile_args_ok(z, x, y) or not (fdir / "meta.json").exists():
+        raise HTTPException(404)
+
+    def render():
+        data = _radar_frame(stamp, (fdir / "meta.json").stat().st_mtime)
+        if not any(tiles.intersects(z, x, y, radar.site_bbox(m)) for _, m in data):
+            return tiles.EMPTY
+        lat, lon = tiles.tile_latlon(z, x, y)
+        dbz = np.full(lat.shape, np.nan, dtype=np.float32)
+        for arr, m in data:
+            dbz = np.fmax(dbz, radar.sample_polar(arr, m, lat, lon))
+        dbz[dbz < settings.radar_min_dbz] = np.nan
+        return tiles.encode(RAIN.colorize(radar.dbz_to_rate(dbz)))
+
+    return _png(tiles.cached(TILE_CACHE / "radar" / stamp / str(z) / str(x) / f"{y}.png", render))
+
+
+@app.get("/tiles/coverage/{key}/{z}/{x}/{y}.png")
+def coverage_tile(key: str, z: int, x: int, y: int):
+    idx = _read_json(RADAR_OUT / "index.json", {})
+    if key != idx.get("coverage_key") or not _tile_args_ok(z, x, y):
+        raise HTTPException(404)
+
+    def render():
+        lat, lon = tiles.tile_latlon(z, x, y)
+        seen = np.zeros(lat.shape, dtype=bool)
+        for m in idx.get("sites", []):
+            seen |= radar.in_range(m, lat, lon)
+        return tiles.encode(tiles.hatch(~seen, z, x, y))
+
+    return _png(tiles.cached(TILE_CACHE / "coverage" / key / str(z) / str(x) / f"{y}.png", render))
+
+
+@lru_cache(maxsize=24)
+def _acc_frame(stamp: str, mtime: float):
+    adir = ACC_FRAMES / stamp
+    return np.load(adir / "values.npy").astype(np.float32), _read_json(adir / "mapping.json", {})
+
+
+@app.get("/tiles/radaracc/{stamp}/{z}/{x}/{y}.png")
+def acc_tile(stamp: str, z: int, x: int, y: int):
+    adir = ACC_FRAMES / stamp
+    if not re.fullmatch(r"\d{12}", stamp) or not _tile_args_ok(z, x, y) or not (adir / "values.npy").exists():
+        raise HTTPException(404)
+
+    def render():
+        vals, m = _acc_frame(stamp, (adir / "values.npy").stat().st_mtime)
+        if m.get("bbox") and not tiles.intersects(z, x, y, m["bbox"]):
+            return tiles.EMPTY
+        lat, lon = tiles.tile_latlon(z, x, y)
+        row, col = radar.cart_frac(m, lat, lon)
+        return tiles.encode(RAIN_ACC.colorize(bilinear(vals, row, col)))
+
+    return _png(tiles.cached(TILE_CACHE / "radaracc" / stamp / str(z) / str(x) / f"{y}.png", render))
+
+
+@app.get("/tiles/nwp/{run_id}/{layer}/{stamp}/{z}/{x}/{y}.png")
+def nwp_tile(run_id: str, layer: str, stamp: str, z: int, x: int, y: int):
+    run_dir = NWP_OUT / run_id
+    if (not re.fullmatch(r"\d{10}", run_id) or not re.fullmatch(r"\d{12}", stamp)
+            or layer not in nwp.LAYERS or not _tile_args_ok(z, x, y) or not (run_dir / "index.json").exists()):
+        raise HTTPException(404)
+    index = _nwp_index(run_id, (run_dir / "index.json").stat().st_mtime)
+    return _png(tiles.cached(run_dir / "tiles" / layer / stamp / str(z) / str(x) / f"{y}.png",
+                             lambda: nwp.render_tile(run_dir, index, layer, stamp, z, x, y)))
+
+
+@lru_cache(maxsize=4)
+def _nwp_index(run_id: str, mtime: float) -> dict:
+    return _read_json(NWP_OUT / run_id / "index.json", {})
 
 
 def _current_run_dir() -> Path | None:
@@ -385,6 +507,7 @@ def nwp_index():
         return {"run": None, "frames": [], "busy": status["nwp"]["busy"], "error": status["nwp"]["error"]}
     idx = _read_json(d / "index.json", {})
     idx["base"] = f"/data/nwp/{d.name}/"
+    idx["tiles"] = f"/tiles/nwp/{d.name}/{{layer}}/{{stamp}}/{{z}}/{{x}}/{{y}}.png"
     return idx
 
 

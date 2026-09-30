@@ -8,7 +8,7 @@ A small self-hosted weather viewer for Ireland built on Met Éireann open data:
 - **Point forecast**: current conditions, a 48-hour meteogram and a daily outlook for any location (Met's WDB point-forecast API).
 - **Warnings**: current Met Éireann warnings shown at the top of the sidebar.
 
-One Python process (FastAPI) polls Met's servers, decodes the raw files (HDF5 radar volumes, GRIB model output), renders transparent PNG overlays to disk and serves a plain HTML/JS frontend. It has no build step, no database, and the fonts and Leaflet are bundled locally.
+One Python process (FastAPI) polls Met's servers, decodes the raw files (HDF5 radar volumes, GRIB model output) and keeps the fields on their original grids. Weather is served as map tiles drawn on request for whatever zoom you're at, interpolated from the source data, so layers stay sharp close in. The frontend is plain HTML/JS on MapLibre GL. It has no build step, no database, and the fonts and Leaflet are bundled locally.
 
 ![screenshot](docs/screenshot.png)
 *(Screenshot uses the bundled synthetic test data, not real weather.)*
@@ -129,4 +129,4 @@ If something doesn't show up, the debug listing plus one sample file is usually 
 
 Radar, NWP, forecast and warnings data: **Copyright Met Éireann. Source: met.ie. Licence: CC BY 4.0.** Met Éireann does not accept any liability whatsoever for any error or omission in the data, their availability, or for any loss or damage arising from their use. The app shows this attribution in the sidebar. Met's forecast-API licence also requires sites that display its forecasts publicly to show Met's warnings, which the app does.
 
-Basemap: [OpenFreeMap](https://openfreemap.org) © OpenMapTiles, data © OpenStreetMap contributors (rendered with MapLibre GL, BSD-3). Coastline from Natural Earth (public domain). IBM Plex fonts (OFL). Leaflet (BSD-2).
+Basemap: [OpenFreeMap](https://openfreemap.org) © OpenMapTiles, data © OpenStreetMap contributors (rendered with MapLibre GL, BSD-3). Coastline from Natural Earth (public domain). IBM Plex fonts (OFL). MapLibre GL JS (BSD-3).

@@ -35,95 +35,132 @@
     set(k, v) { try { localStorage.setItem("aimsir." + k, JSON.stringify(v)); } catch { /* private mode */ } },
   };
 
-  // ------------------------------------------------------------ map
+  // ------------------------------------------------------------ map (MapLibre GL)
+  // One GPU-drawn map for everything: basemap, weather tiles, isobars and labels
+  // all move together, so zooming is smooth and nothing snaps into place afterwards.
   const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-  const map = L.map("map", { zoomControl: false, attributionControl: true, minZoom: 5, maxZoom: 11, zoomSnap: 0.5 })
-    .setView([53.45, -7.9], 7);
-  L.control.zoom({ position: "topleft" }).addTo(map);
-  map.createPane("labels").style.zIndex = 450;
-  map.getPane("labels").style.pointerEvents = "none";
-  map.createPane("isobars").style.zIndex = 430;
-  map.createPane("coast").style.zIndex = 425;
-  map.getPane("coast").style.pointerEvents = "none";
-  map.attributionControl.setPrefix(false);
-  map.attributionControl.addAttribution('Weather © <a href="https://www.met.ie">Met Éireann</a>');
-  window.aimsirMap = map; // handy from the dev console
-
-  // Natural Earth coastline (bundled). Drawn over model layers, and always when there is no basemap.
-  let coast = null;
+  const OFM = "https://tiles.openfreemap.org";
+  const GLYPHS = `${OFM}/fonts/{fontstack}/{range}.pbf`;
+  const FONT = ["Noto Sans Regular"];
+  const INK = dark ? "#e6e3da" : "#1c1f22";
+  const HALO = dark ? "rgba(23,25,27,0.9)" : "rgba(250,249,245,0.92)";
+  let map = null;
+  let firstSymbol;          // weather goes below the basemap's labels
   let coastAlways = false;
-  const syncCoast = () => {
-    if (!coast) return;
-    const want = coastAlways || !isRadar(S.mode);
-    if (want && !map.hasLayer(coast)) coast.addTo(map);
-    if (!want && map.hasLayer(coast)) map.removeLayer(coast);
-  };
-  fetch("/static/coast.json").then((r) => r.json()).then((gj) => {
-    coast = L.geoJSON(gj, { pane: "coast", interactive: false, style: { color: dark ? "#e6e3da" : "#1c1f22", weight: 0.7, opacity: 0.55 } });
-    syncCoast();
-  }).catch(() => {});
 
-  const loadAsset = (src) => new Promise((ok, fail) => {
-    const el = src.endsWith(".css") ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
-      : Object.assign(document.createElement("script"), { src });
-    el.onload = ok;
-    el.onerror = () => fail(new Error("failed to load " + src));
-    document.head.appendChild(el);
-  });
-
-  // Basemap: OpenFreeMap vector tiles (free, no key) by default. The style is split in two so
-  // place names sit above the weather overlays: shapes in the tile pane, labels in the labels pane.
-  async function setupBasemap(kind) {
+  async function buildStyle(kind) {
+    const plain = {
+      version: 8, glyphs: GLYPHS, sources: {},
+      layers: [{ id: "bg", type: "background", paint: { "background-color": dark ? "#1b1e21" : "#e4e6e3" } }],
+    };
     if (kind === "openfreemap") {
       try {
-        await loadAsset("/static/vendor/maplibre/maplibre-gl.css");
-        await loadAsset("/static/vendor/maplibre/maplibre-gl.js");
-        await loadAsset("/static/vendor/maplibre/leaflet-maplibre-gl.js");
-        const r = await fetch(`https://tiles.openfreemap.org/styles/${dark ? "dark" : "positron"}`);
+        const r = await fetch(`${OFM}/styles/${dark ? "dark" : "positron"}`);
         if (!r.ok) throw new Error(`style ${r.status}`);
         const style = await r.json();
-        const part = (keep) => ({ ...style, layers: style.layers.filter(keep) });
-        // Labels sit on top of coloured weather layers, so keep only place/water names
-        // (no road shields or POIs) and give them a firm halo that reads on any overlay.
+        // Keep place and water names only (no road shields or POIs), with a firm halo
+        // so they stay readable on top of coloured weather layers.
         const clutter = /highway|road|poi|shield|transport|aeroway|airport|rail|housenumber|building/i;
-        const labelLayers = style.layers
-          .filter((l) => l.type === "symbol" && !clutter.test(l.id) && l.layout?.["text-field"])
-          .map((l) => ({
+        style.layers = style.layers
+          .filter((l) => l.type !== "symbol" || (!clutter.test(l.id) && l.layout?.["text-field"]))
+          .map((l) => (l.type === "line" && dark && /road|highway|transport|bridge|tunnel/i.test(l.id)
+            ? { ...l, paint: { ...l.paint, "line-opacity": 0.35 } }   // dark roads fight with weather colours
+            : l))
+          .map((l) => (l.type !== "symbol" ? l : {
             ...l,
             layout: { ...l.layout, "icon-image": "", "text-transform": "none", "text-letter-spacing": 0.02 },
-            paint: {
-              ...l.paint,
-              "text-color": dark ? "#e6e3da" : "#2b2e31",
-              "text-halo-color": dark ? "rgba(23,25,27,0.9)" : "rgba(250,249,245,0.92)",
-              "text-halo-width": dark ? 1.1 : 1.4,
-              "text-halo-blur": dark ? 0.6 : 0.2,
-            },
+            paint: { ...l.paint, "text-color": dark ? "#e6e3da" : "#2b2e31", "text-halo-color": HALO,
+                     "text-halo-width": dark ? 1.1 : 1.4, "text-halo-blur": dark ? 0.6 : 0.2 },
           }));
-        L.maplibreGL({ style: part((l) => l.type !== "symbol"), interactive: false }).addTo(map);
-        L.maplibreGL({ style: { ...style, layers: labelLayers }, pane: "labels", interactive: false }).addTo(map);
-        return;
+        return style;
       } catch (e) {
-        console.warn("OpenFreeMap basemap unavailable, falling back to coastline only:", e);
+        console.warn("OpenFreeMap basemap unavailable, using the bundled coastline:", e);
         kind = "none";
       }
     }
     if (kind === "osm") {
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19, className: dark ? "osm-dark" : "",
-        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-      }).addTo(map);
-      return;
+      plain.sources.osm = { type: "raster", tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize: 256,
+                            maxzoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' };
+      plain.layers.push({ id: "osm", type: "raster", source: "osm",
+                          paint: dark ? { "raster-brightness-min": 0.92, "raster-brightness-max": 0.12, "raster-saturation": -0.7 }
+                                      : { "raster-saturation": -0.35 } });
+      return plain;
     }
-    coastAlways = true; // "none": sea-coloured background + bundled coastline, nothing external
+    coastAlways = true; // "none": plain background + bundled coastline, nothing external
+    return plain;
+  }
+
+  async function initMap(kind) {
+    const style = await buildStyle(kind);
+    map = new maplibregl.Map({
+      container: "map", style, center: [-7.9, 53.45], zoom: 6.3, minZoom: 4.5, maxZoom: 12.5,
+      attributionControl: false, dragRotate: false, pitchWithRotate: false, touchPitch: false,
+      fadeDuration: 0,
+    });
+    map.touchZoomRotate.disableRotation();
+    map.keyboard.disableRotation();
+    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
+    map.addControl(new maplibregl.AttributionControl({
+      compact: true, customAttribution: 'Weather © <a href="https://www.met.ie">Met Éireann</a>',
+    }), "bottom-right");
+    window.aimsirMap = map; // handy from the dev console
+    await new Promise((ok) => (map.loaded() ? ok() : map.once("load", ok)));
+
+    // Some basemap label layers (water names) sit below the road lines in the style.
+    // Lift every label to the top so the weather can go between shapes and labels.
+    for (const l of map.getStyle().layers) if (l.type === "symbol") map.moveLayer(l.id);
+    firstSymbol = map.getStyle().layers.find((l) => l.type === "symbol")?.id;
+    if (matchMedia("(max-width: 760px)").matches) {
+      document.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show");
+    }
+    // Invisible marker layer: weather frames are inserted below it, overlays above it.
+    map.addLayer({ id: "anchor-wx", type: "background", paint: { "background-opacity": 0 } }, firstSymbol);
+
+    map.addSource("coast", { type: "geojson", data: "/static/coast.json" });
+    map.addLayer({ id: "coast", type: "line", source: "coast", layout: { visibility: "none" },
+                   paint: { "line-color": INK, "line-width": 0.7, "line-opacity": 0.55 } }, firstSymbol);
+
+    map.addSource("isobars", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({ id: "isobars", type: "line", source: "isobars",
+                   paint: { "line-color": INK, "line-opacity": 0.6,
+                            "line-width": ["case", ["==", ["%", ["get", "hpa"], 20], 0], 1.4, 0.8] } }, firstSymbol);
+    map.addLayer({ id: "isobar-labels", type: "symbol", source: "isobars",
+                   layout: { "symbol-placement": "line", "symbol-spacing": 320, "text-field": ["to-string", ["get", "hpa"]],
+                             "text-font": FONT, "text-size": 10, "text-keep-upright": true },
+                   paint: { "text-color": dark ? "#b9b6ad" : "#4a4d50", "text-halo-color": HALO, "text-halo-width": 1.5 } });
+
+    map.on("click", onMapClick);
     syncCoast();
+  }
+
+  function syncCoast() {
+    if (!map?.getLayer("coast")) return;
+    const want = coastAlways || !isRadar(S.mode);
+    map.setLayoutProperty("coast", "visibility", want ? "visible" : "none");
+  }
+
+  function ensureCoverage() {
+    const url = S.radar?.coverage;
+    if (!map || !url) return;
+    if (map.getSource("coverage") && S.coverageUrl !== url) {
+      map.removeLayer("coverage");
+      map.removeSource("coverage");
+    }
+    if (!map.getSource("coverage")) {
+      map.addSource("coverage", { type: "raster", tiles: [url], tileSize: 256, minzoom: 3, maxzoom: 10 });
+      map.addLayer({ id: "coverage", type: "raster", source: "coverage",
+                     paint: { "raster-fade-duration": 0, "raster-resampling": "nearest" } }, "coast");
+      S.coverageUrl = url;
+    }
+    map.setLayoutProperty("coverage", "visibility", S.mode === "radar" ? "visible" : "none");
   }
 
   // ------------------------------------------------------------ state
   const S = {
     cfg: null, radar: null, nwp: null, mode: store.get("mode", "radar"),
     frames: [], i: 0, playing: false, timer: null, followLatest: true,
-    overlays: new Map(), current: null, want: null, coverage: null,
-    isobars: store.get("isobars", true), isoLayer: null, isoCache: new Map(), isoStamp: null,
+    currentId: null, wantId: null, wxIds: new Set(), coverageUrl: null,
+    isobars: store.get("isobars", true), isoCache: new Map(), isoStamp: null,
     place: store.get("place", null), homePin: null, status: null,
   };
 
@@ -131,54 +168,86 @@
   const isRadar = (m) => RADAR_MODES.includes(m);
   const MORE_MODES = ["radaracc", "gust", "lightning", "vis", "snow"];
 
-  // ------------------------------------------------------------ frames / overlays
+  // ------------------------------------------------------------ frames (raster tile sources)
   function framesFor(mode) {
+    const mk = (time, stamp, tpl) => ({ t: new Date(time), stamp, url: tpl.replace("{stamp}", stamp) });
     if (mode === "radar") {
       const r = S.radar;
-      return r ? r.frames.map((f) => ({ t: new Date(f.time), url: f.url, stamp: f.stamp })) : [];
+      return r?.tiles ? r.frames.map((f) => mk(f.time, f.stamp, r.tiles)) : [];
     }
     if (mode === "radaracc") {
       const a = S.radar?.acc;
-      return a ? a.frames.map((f) => ({ t: new Date(f.time), url: f.url, stamp: f.stamp })) : [];
+      return a?.tiles ? a.frames.map((f) => mk(f.time, f.stamp, a.tiles)) : [];
     }
     const n = S.nwp;
-    if (!n || !n.frames) return [];
+    if (!n?.frames || !n.tiles) return [];
     return n.frames.filter((f) => f.layers.includes(mode))
-      .map((f) => ({ t: new Date(f.valid), url: `${n.base}${mode}_${f.stamp}.png`, stamp: f.stamp }));
+      .map((f) => mk(f.valid, f.stamp, n.tiles.replace("{layer}", mode)));
   }
-  const boundsFor = (mode) => (isRadar(mode) ? S.radar?.bounds : S.nwp?.bounds);
+
+  function sourceOpts(url) {
+    const o = { type: "raster", tiles: [url], tileSize: 256, minzoom: 3, maxzoom: isRadar(S.mode) ? 11 : 10 };
+    const bb = S.mode === "radar" ? S.radar?.bbox : isRadar(S.mode) ? null : S.nwp?.bbox;
+    if (bb) o.bounds = [Math.max(bb[0], -180), Math.max(bb[1], -85), Math.min(bb[2], 180), Math.min(bb[3], 85)];
+    return o;
+  }
+
+  function ensureFrame(f) {
+    const id = `wx-${S.mode}-${f.stamp}`;
+    if (!map.getSource(id)) {
+      map.addSource(id, sourceOpts(f.url));
+      map.addLayer({ id, type: "raster", source: id,
+                     paint: { "raster-opacity": 0, "raster-fade-duration": 0, "raster-resampling": "linear" } }, "anchor-wx");
+      S.wxIds.add(id);
+    }
+    return id;
+  }
+
+  function removeFrame(id) {
+    if (map.getLayer(id)) map.removeLayer(id);
+    if (map.getSource(id)) map.removeSource(id);
+    S.wxIds.delete(id);
+  }
 
   function clearOverlays() {
-    for (const ov of S.overlays.values()) map.removeLayer(ov);
-    S.overlays.clear();
-    S.current = null;
+    if (!map) return;
+    for (const id of [...S.wxIds]) removeFrame(id);
+    S.currentId = null;
+    S.wantId = null;
   }
 
-  function overlay(url) {
-    let ov = S.overlays.get(url);
-    if (!ov) {
-      ov = L.imageOverlay(url, boundsFor(S.mode), { opacity: 0, className: "wx", interactive: false }).addTo(map);
-      ov._ready = false;
-      ov.on("load", () => { ov._ready = true; if (S.want === url && S.overlays.get(url) === ov) swap(ov); });
-      S.overlays.set(url, ov);
-    }
-    return ov;
+  function reveal(id) {
+    if (S.currentId && S.currentId !== id && map.getLayer(S.currentId)) map.setPaintProperty(S.currentId, "raster-opacity", 0);
+    if (map.getLayer(id)) map.setPaintProperty(id, "raster-opacity", 1);
+    S.currentId = id;
   }
-  function swap(ov) {
-    if (S.current && S.current !== ov) S.current.setOpacity(0);
-    ov.setOpacity(1);
-    S.current = ov;
+
+  // Swap frames only once the next one's tiles are in, so animation never flashes blank.
+  let revealTimer = null;
+  function onSourceData(e) {
+    if (e.sourceId && e.sourceId === S.wantId && map.isSourceLoaded(e.sourceId)) {
+      clearTimeout(revealTimer);
+      reveal(e.sourceId);
+    }
   }
 
   function show(i) {
-    if (!S.frames.length) return;
+    if (!S.frames.length || !map) return;
     S.i = Math.max(0, Math.min(S.frames.length - 1, i));
     S.followLatest = isRadar(S.mode) && S.i === S.frames.length - 1;
     const f = S.frames[S.i];
-    S.want = f.url;
-    const ov = overlay(f.url);
-    if (ov._ready) swap(ov);
-    for (let k = 1; k <= 3; k++) if (S.frames[S.i + k]) overlay(S.frames[S.i + k].url);
+    const id = ensureFrame(f);
+    S.wantId = id;
+    clearTimeout(revealTimer);
+    if (map.isSourceLoaded(id)) reveal(id);
+    else revealTimer = setTimeout(() => S.wantId === id && reveal(id), S.playing ? 1500 : 250);
+    // keep a small window of frames loaded around the current one
+    const keep = new Set([id, S.currentId]);
+    for (let k = -1; k <= 3; k++) {
+      const g = S.frames[(S.i + k + S.frames.length) % S.frames.length];
+      if (g) keep.add(ensureFrame(g));
+    }
+    for (const other of [...S.wxIds]) if (!keep.has(other)) removeFrame(other);
     drawClock(f.t);
     $("#head").style.left = pos(f.t) * 100 + "%";
     updateIsobars(f.t);
@@ -246,10 +315,21 @@
     if (S.frames.length < 2) return;
     S.playing = true;
     $("#play").classList.add("on");
+    let waitingSince = 0;
+    // Advance only when the next frame's tiles are ready (or after a short grace period),
+    // so a slow connection slows the loop down instead of showing half-drawn frames.
     const step = () => {
-      const last = S.i >= S.frames.length - 1;
-      show(last ? 0 : S.i + 1);
-      const hold = S.i === S.frames.length - 1 ? 1400 : S.mode === "radar" ? 280 : 450;
+      if (!S.playing) return;
+      const next = S.i >= S.frames.length - 1 ? 0 : S.i + 1;
+      const id = ensureFrame(S.frames[next]);
+      waitingSince ||= Date.now();
+      if (!map.isSourceLoaded(id) && Date.now() - waitingSince < 2500) {
+        S.timer = setTimeout(step, 60);
+        return;
+      }
+      waitingSince = 0;
+      show(next);
+      const hold = S.i === S.frames.length - 1 ? 1400 : isRadar(S.mode) ? 260 : 420;
       S.timer = setTimeout(step, hold);
     };
     if (S.i >= S.frames.length - 1) show(0);
@@ -280,7 +360,7 @@
     S.frames = framesFor(mode);
     drawTicks();
     drawLegend();
-    if (S.coverage) S.coverage.setOpacity(mode === "radar" ? 1 : 0);
+    ensureCoverage();
     syncCoast();
     emptyState();
     if (!S.frames.length) { $("#head").style.left = "0"; updateIsobars(new Date()); return; }
@@ -334,10 +414,12 @@
   }
 
   // ------------------------------------------------------------ isobars
+  const EMPTY_FC = { type: "FeatureCollection", features: [] };
   async function updateIsobars(t) {
-    const on = S.isobars && S.nwp?.frames?.length;
     document.querySelector("#isobars").checked = S.isobars;
-    if (!on) { if (S.isoLayer) { map.removeLayer(S.isoLayer); S.isoLayer = null; S.isoStamp = null; } return; }
+    if (!map?.getSource("isobars")) return;
+    const on = S.isobars && S.nwp?.frames?.length;
+    if (!on) { map.getSource("isobars").setData(EMPTY_FC); S.isoStamp = null; return; }
     const withMsl = S.nwp.frames.filter((f) => f.layers.includes("msl"));
     if (!withMsl.length) return;
     let best = withMsl[0];
@@ -349,24 +431,7 @@
       try { gj = await getJSON(`${S.nwp.base}msl_${best.stamp}.json`); } catch { return; }
       S.isoCache.set(best.stamp, gj);
     }
-    if (S.isoStamp !== best.stamp) return;
-    const ink = getComputedStyle(document.documentElement).getPropertyValue("--ink").trim();
-    const layer = L.layerGroup();
-    L.geoJSON(gj, {
-      pane: "isobars", interactive: false,
-      style: (f) => ({ color: ink, weight: f.properties.hpa % 20 === 0 ? 1.4 : 0.8, opacity: 0.6 }),
-    }).addTo(layer);
-    for (const f of gj.features) {
-      const c = f.geometry.coordinates;
-      if (c.length < 14) continue;
-      const m = c[Math.floor(c.length / 2)];
-      L.marker([m[1], m[0]], {
-        pane: "isobars", interactive: false,
-        icon: L.divIcon({ className: "isobar-label", html: f.properties.hpa, iconSize: [30, 12], iconAnchor: [15, 6] }),
-      }).addTo(layer);
-    }
-    if (S.isoLayer) map.removeLayer(S.isoLayer);
-    S.isoLayer = layer.addTo(map);
+    if (S.isoStamp === best.stamp) map.getSource("isobars").setData(gj);
   }
   $("#isobars").addEventListener("change", (e) => {
     S.isobars = e.target.checked;
@@ -376,15 +441,15 @@
   });
 
   // ------------------------------------------------------------ map click
-  map.on("click", async (e) => {
-    const { lat, lng } = e.latlng;
-    const pop = L.popup({ maxWidth: 260 }).setLatLng(e.latlng);
+  async function onMapClick(e) {
+    const { lat, lng } = e.lngLat;
     const head = `<h3>${lat.toFixed(2)}°N ${Math.abs(lng).toFixed(2)}°${lng < 0 ? "W" : "E"}</h3>`;
     const btn = `<button type="button" data-go>Forecast for here</button>`;
-    pop.setContent(`<div class="pop">${head}${btn}</div>`).openOn(map);
+    const pop = new maplibregl.Popup({ maxWidth: "260px", closeButton: true, focusAfterOpen: false })
+      .setLngLat(e.lngLat).setHTML(`<div class="pop">${head}${btn}</div>`).addTo(map);
     const wire = () => pop.getElement()?.querySelector("[data-go]")?.addEventListener("click", () => {
       setPlace({ name: `${lat.toFixed(2)}, ${lng.toFixed(2)}`, lat, lon: lng, custom: true });
-      map.closePopup();
+      pop.remove();
     });
     wire();
     if (!S.nwp?.frames?.length) return;
@@ -404,11 +469,12 @@
         ["Snow", v.snow != null && v.snow >= 0.5 && `${v.snow.toFixed(0)} mm w.e.`],
         ["Lightning", v.lightning != null && v.lightning >= 0.5 && v.lightning.toFixed(v.lightning < 10 ? 1 : 0)],
       ].filter((r) => r[1]);
-      pop.setContent(`<div class="pop">${head}<table>${rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>` +
+      if (!pop.isOpen()) return;
+      pop.setHTML(`<div class="pop">${head}<table>${rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>` +
         `<h3 style="margin:6px 0 0">model · ${fDate.format(new Date(best.valid))} ${hm(new Date(best.valid))}</h3>${btn}</div>`);
       wire();
     } catch { /* outside model domain */ }
-  });
+  }
 
   const compass = (deg) => (deg == null ? "" : ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8]);
 
@@ -430,10 +496,9 @@
     S.place = p;
     store.set("place", p);
     buildPlaces();
-    if (S.homePin) map.removeLayer(S.homePin);
-    S.homePin = L.marker([p.lat, p.lon], {
-      interactive: false, icon: L.divIcon({ className: "", html: '<div class="home-pin"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }),
-    }).addTo(map);
+    if (S.homePin) S.homePin.remove();
+    const pin = Object.assign(document.createElement("div"), { className: "home-pin" });
+    S.homePin = new maplibregl.Marker({ element: pin }).setLngLat([p.lon, p.lat]).addTo(map);
     loadForecast();
   }
 
@@ -593,9 +658,7 @@
       const sig = (x) => JSON.stringify([x?.frames?.map((f) => f.stamp), x?.acc?.frames?.map((f) => f.stamp)]);
       const changed = sig(r) !== sig(S.radar);
       S.radar = r;
-      if (r.coverage && !S.coverage) {
-        S.coverage = L.imageOverlay(r.coverage + "?v=" + Date.now(), r.bounds, { interactive: false, opacity: S.mode === "radar" ? 1 : 0 }).addTo(map);
-      }
+      ensureCoverage();
       if (changed && S.booted && isRadar(S.mode)) {
         const follow = S.followLatest || !S.frames.length;
         const cur = S.frames[S.i]?.stamp;
@@ -636,7 +699,8 @@
   // ------------------------------------------------------------ boot
   (async function boot() {
     S.cfg = await getJSON("/api/config").catch(() => ({ home: { name: "Dublin", lat: 53.35, lon: -6.26 }, has_key: false, basemap: "openfreemap" }));
-    setupBasemap(S.cfg.basemap || "openfreemap");
+    await initMap(S.cfg.basemap || "openfreemap");
+    map.on("sourcedata", onSourceData);
     if (!S.place) S.place = { name: S.cfg.home.name, lat: S.cfg.home.lat, lon: S.cfg.home.lon, custom: !PLACES.some((p) => p[0] === S.cfg.home.name) };
     setPlace(S.place);
     await Promise.all([refreshStatus(), refreshRadar(), refreshNwp()]);

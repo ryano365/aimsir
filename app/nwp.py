@@ -6,22 +6,22 @@ file is scanned, messages we care about are recognised by their keys, and the
 newest model run is rendered hour by hour."""
 from __future__ import annotations
 
-import io
 import json
+import shutil
 import logging
 import math
 from collections import defaultdict
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
-from scipy.spatial import cKDTree
 
 import eccodes as ec
 
-from .geo import NWP_GRID, MercGrid, to_xyz
+from . import tiles
+from .grids import GridSampler, bilinear
 from .palettes import CLOUD, GUST, LIGHTNING, RAIN, SNOW, TEMP, VIS, WIND
 
 log = logging.getLogger(__name__)
@@ -197,102 +197,6 @@ def _read(ref: MsgRef):
             raise
 
 
-class Regridder:
-    """Nearest-neighbour lookup from any GRIB grid onto the Mercator grid."""
-
-    def __init__(self, h, grid: MercGrid):
-        lats = ec.codes_get_array(h, "latitudes")
-        lons = ec.codes_get_array(h, "longitudes")
-        lons = np.where(lons > 180, lons - 360, lons)
-        self.ni, self.nj = _get(h, "Ni"), _get(h, "Nj")
-        tree = cKDTree(to_xyz(lats, lons))
-        # typical spacing, to blank pixels outside the model domain
-        sample = to_xyz(lats[:: max(1, lats.size // 2000)], lons[:: max(1, lats.size // 2000)])
-        d, _ = tree.query(sample, k=2)
-        spacing = float(np.median(d[:, 1]))
-        lat2d, lon2d = grid.mesh
-        dist, idx = tree.query(to_xyz(lat2d.ravel(), lon2d.ravel()))
-        self.idx = idx.reshape(lat2d.shape)
-        self.inside = (dist < spacing * 1.6).reshape(lat2d.shape)
-        self.grid = grid
-        # Grid x-axis angle vs east, for rotating grid-relative winds.
-        self.alpha = None
-        if self.ni and self.nj and self.ni * self.nj == lats.size:
-            la2, lo2 = lats.reshape(self.nj, self.ni), lons.reshape(self.nj, self.ni)
-            dlat = np.gradient(la2, axis=1)
-            dlon = np.gradient(lo2, axis=1) * np.cos(np.radians(la2))
-            self.alpha = np.arctan2(dlat, dlon).ravel().astype(np.float32)
-
-    def __call__(self, values: np.ndarray) -> np.ndarray:
-        out = values[self.idx]
-        out[~self.inside] = np.nan
-        return out
-
-    def earth_winds(self, u, v, relative: bool, i_neg: bool):
-        if not relative or self.alpha is None:
-            return u, v
-        a = self.alpha + (np.pi if i_neg else 0.0)
-        ca, sa = np.cos(a), np.sin(a)
-        return u * ca - v * sa, u * sa + v * ca
-
-
-# ---------------------------------------------------------------- rendering
-
-def _png(rgba: np.ndarray) -> bytes:
-    buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, "PNG", optimize=True)
-    return buf.getvalue()
-
-
-def wind_png(speed_kmh: np.ndarray, u: np.ndarray, v: np.ndarray, spacing: int = 34) -> bytes:
-    img = Image.fromarray(WIND.colorize(speed_kmh), "RGBA")
-    draw = ImageDraw.Draw(img)
-    h, w = speed_kmh.shape
-    for r in range(spacing // 2, h, spacing):
-        for c in range(spacing // 2, w, spacing):
-            s = speed_kmh[r, c]
-            if not np.isfinite(s) or s < 3:
-                continue
-            # screen angle of the direction the wind blows towards (image y points down)
-            th = math.atan2(-v[r, c], u[r, c])
-            length = 7 + min(s, 90) / 90 * 11
-            dx, dy = math.cos(th) * length / 2, math.sin(th) * length / 2
-            x0, y0, x1, y1 = c - dx, r - dy, c + dx, r + dy
-            col = (38, 44, 50, 200)
-            draw.line([(x0, y0), (x1, y1)], fill=col, width=1)
-            for side in (0.5, -0.5):
-                draw.line([(x1, y1), (x1 - math.cos(th + side) * 4.5, y1 - math.sin(th + side) * 4.5)],
-                          fill=col, width=1)
-    buf = io.BytesIO()
-    img.save(buf, "PNG", optimize=True)
-    return buf.getvalue()
-
-
-def isobars(msl_hpa: np.ndarray, grid: MercGrid, interval: int = 4) -> dict:
-    import contourpy
-
-    feats = []
-    finite = msl_hpa[np.isfinite(msl_hpa)]
-    if finite.size == 0:
-        return {"type": "FeatureCollection", "features": []}
-    lo = int(math.floor(finite.min() / interval) * interval)
-    hi = int(math.ceil(finite.max() / interval) * interval)
-    z = np.ma.masked_invalid(msl_hpa)
-    gen = contourpy.contour_generator(z=z, name="serial")
-    for level in range(lo, hi + 1, interval):
-        for line in gen.lines(level):
-            if len(line) < 6:
-                continue
-            line = line[::2] if len(line) > 40 else line
-            lon, lat = grid.pixel_to_lonlat(line[:, 0], line[:, 1])
-            coords = np.round(np.column_stack([lon, lat]), 3).tolist()
-            feats.append({"type": "Feature", "properties": {"hpa": level},
-                          "geometry": {"type": "LineString", "coordinates": coords}})
-    return {"type": "FeatureCollection", "features": feats}
-
-
-# ---------------------------------------------------------------- pipeline
-
 LAYERS = {
     "rain": {"scale": RAIN},
     "temp": {"scale": TEMP},
@@ -303,7 +207,6 @@ LAYERS = {
     "snow": {"scale": SNOW},
     "lightning": {"scale": LIGHTNING},
 }
-INSPECT_STEP = 3  # decimation for the click-to-inspect value store
 
 
 def pick_run(refs: list[MsgRef], max_hours: int) -> datetime:
@@ -320,8 +223,51 @@ def pick_run(refs: list[MsgRef], max_hours: int) -> datetime:
     return max(run for run, v in hours.items() if len(v) >= 0.9 * best)
 
 
-def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGrid = NWP_GRID) -> dict:
-    """Render every hour of the newest run found in refs. Returns the index."""
+
+# ---------------------------------------------------------------- pipeline
+
+STORED = ("rain", "temp", "cloud", "wind", "u", "v", "msl", "gust", "vis", "snow", "lightning")
+
+
+def _grid_keys(h) -> dict:
+    keys = {}
+    for k in ("Latin1InDegrees", "Latin2InDegrees", "LaDInDegrees", "LoVInDegrees", "radius",
+              "orientationOfTheGridInDegrees"):
+        v = _get(h, k)
+        if v is not None:
+            keys[k] = float(v)
+    return keys
+
+
+def _isobars(msl: np.ndarray, lats: np.ndarray, lons: np.ndarray, interval: int = 4) -> dict:
+    """Contour MSLP on the model's own grid, then place the lines by the grid's lat/lon."""
+    import contourpy
+
+    feats = []
+    finite = msl[np.isfinite(msl)]
+    if finite.size == 0:
+        return {"type": "FeatureCollection", "features": []}
+    lo = int(math.floor(finite.min() / interval) * interval)
+    hi = int(math.ceil(finite.max() / interval) * interval)
+    gen = contourpy.contour_generator(z=np.ma.masked_invalid(msl), name="serial")
+    for level in range(lo, hi + 1, interval):
+        for line in gen.lines(level):
+            if len(line) < 5:
+                continue
+            la = bilinear(lats, line[:, 1], line[:, 0])
+            lo_ = bilinear(lons, line[:, 1], line[:, 0])
+            ok = np.isfinite(la) & np.isfinite(lo_)
+            if ok.sum() < 5:
+                continue
+            coords = np.round(np.column_stack([lo_[ok], la[ok]]), 4).tolist()
+            feats.append({"type": "Feature", "properties": {"hpa": level},
+                          "geometry": {"type": "LineString", "coordinates": coords}})
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int) -> dict:
+    """Decode every hour of the newest run and store the fields on the model's own
+    grid (float16 .npy), ready to be drawn as map tiles at any zoom."""
     if not refs:
         raise ValueError("no recognised NWP fields in the downloaded files")
     run = pick_run(refs, max_hours)
@@ -331,114 +277,123 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
         by_time[r.valid][r.field] = r
     times = sorted(by_time)
     run_dir = out_dir / run.strftime("%Y%m%d%H")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(run_dir / "tiles", ignore_errors=True)   # re-rendered from the new fields
+    fdir = run_dir / "fields"
+    fdir.mkdir(parents=True, exist_ok=True)
 
-    regridders: dict[tuple, Regridder] = {}
+    grids: dict[tuple, dict] = {}        # signature -> {gid, sampler, lats, lons, alpha}
+    layer_grid: dict[str, str] = {}
     prev_tp: tuple[datetime, np.ndarray] | None = None
     frames = []
     ranges: dict[str, list[float]] = {}
     for t in times:
-        fields = by_time[t]
-        vals: dict[str, np.ndarray] = {}
-        geo_uv = None
-        for name, ref in fields.items():
+        vals: dict[str, tuple[str, np.ndarray]] = {}
+        uv: dict[str, np.ndarray] = {}
+        uv_geo = None
+        for name, ref in by_time[t].items():
             try:
                 raw, geo, h = _read(ref)
             except Exception as e:  # noqa: BLE001
                 log.warning("skip %s @ %s: %s", name, t, e)
                 continue
             try:
-                rg = regridders.get(geo["sig"])
-                if rg is None:
-                    rg = regridders[geo["sig"]] = Regridder(h, grid)
+                g = grids.get(geo["sig"])
+                if g is None:
+                    nj, ni = geo["Nj"], geo["Ni"]
+                    lats = ec.codes_get_array(h, "latitudes").reshape(nj, ni)
+                    lons = ec.codes_get_array(h, "longitudes").reshape(nj, ni)
+                    lons = np.where(lons > 180, lons - 360, lons)
+                    sampler = GridSampler.from_latlon(lats, lons, str(geo["gridType"]), _grid_keys(h))
+                    gid = f"g{len(grids)}"
+                    sampler.save(run_dir, gid)
+                    dlat = np.gradient(lats, axis=1)
+                    dlon = np.gradient(lons, axis=1) * np.cos(np.radians(lats))
+                    g = grids[geo["sig"]] = {"gid": gid, "sampler": sampler, "lats": lats, "lons": lons,
+                                             "alpha": np.arctan2(dlat, dlon)}
             finally:
                 ec.codes_release(h)
+            arr = raw.reshape(g["lats"].shape)
+            gid = g["gid"]
             if name in ("u10", "v10"):
-                vals[name + "_raw"] = raw
-                geo_uv = geo
+                uv[name] = arr
+                uv_geo = (geo, g)
                 continue
             if name == "tp":
                 if ref.step_type == "accum" or ref.units in ("kg m**-2", "kg m-2", "mm"):
-                    acc = raw
+                    acc = arr
                     if prev_tp is not None and t > prev_tp[0]:
                         hours = (t - prev_tp[0]).total_seconds() / 3600
                         rate = np.clip(acc - prev_tp[1], 0, None) / hours
                     elif t == run:
                         rate = np.zeros_like(acc)
-                    else:  # first accum field after start: average since run start
+                    else:
                         rate = acc / max((t - run).total_seconds() / 3600, 1)
                     prev_tp = (t, acc)
-                    raw = rate
-                else:  # rate in kg m-2 s-1
-                    raw = raw * 3600.0
-                vals["rain"] = rg(raw)
+                    arr = rate
+                else:
+                    arr = arr * 3600.0
+                vals["rain"] = (gid, arr)
             elif name == "t2":
-                vals["temp"] = rg(raw - 273.15 if np.nanmean(raw) > 150 else raw)
+                vals["temp"] = (gid, arr - 273.15 if np.nanmean(arr) > 150 else arr)
             elif name == "msl":
-                vals["msl"] = rg(raw / 100.0 if np.nanmean(raw) > 2000 else raw)
+                vals["msl"] = (gid, arr / 100.0 if np.nanmean(arr) > 2000 else arr)
             elif name == "tcc":
-                vals["cloud"] = rg(raw * 100.0 if np.nanmax(raw) <= 1.01 else raw)
+                vals["cloud"] = (gid, arr * 100.0 if np.nanmax(arr) <= 1.01 else arr)
             elif name in CLOUD_LAYERS:
-                c = rg(raw * 100.0 if np.nanmax(raw) <= 1.01 else raw)
-                vals["_layers"] = c if "_layers" not in vals else np.fmax(vals["_layers"], c)
+                c = arr * 100.0 if np.nanmax(arr) <= 1.01 else arr
+                prev = vals.get("_layers")
+                vals["_layers"] = (gid, c if prev is None else np.fmax(prev[1], c))
             elif name == "gust":
-                vals["gust"] = rg(raw) * 3.6
+                vals["gust"] = (gid, arr * 3.6)
             elif name in ("gu", "gv"):
-                vals[name] = rg(raw)          # speed only, so grid rotation doesn't matter
+                vals[name] = (gid, arr)
             elif name == "vis":
-                vals["vis"] = rg(raw / 1000.0 if np.nanmax(raw) > 200 else raw)   # m -> km
+                vals["vis"] = (gid, arr / 1000.0 if np.nanmax(arr) > 200 else arr)
             elif name == "sd":
-                # snow water equivalent: kg m-2 == mm; metres of water -> mm
-                vals["snow"] = rg(raw * 1000.0 if ref.units.strip() == "m" else raw)
+                vals["snow"] = (gid, arr * 1000.0 if ref.units.strip() == "m" else arr)
             elif name == "ltg":
-                vals["lightning"] = rg(raw)
+                vals["lightning"] = (gid, arr)
+        if "cloud" not in vals and "_layers" in vals:
+            vals["cloud"] = vals["_layers"]
+        vals.pop("_layers", None)
         if "gust" not in vals and "gu" in vals and "gv" in vals:
-            vals["gust"] = np.hypot(vals["gu"], vals["gv"]) * 3.6
+            vals["gust"] = (vals["gu"][0], np.hypot(vals["gu"][1], vals["gv"][1]) * 3.6)
         vals.pop("gu", None)
         vals.pop("gv", None)
-        if "cloud" not in vals and "_layers" in vals:
-            vals["cloud"] = vals["_layers"]  # maximum-overlap estimate of total cloud
-        vals.pop("_layers", None)
-        if "u10_raw" in vals and "v10_raw" in vals and geo_uv is not None:
-            rg = regridders[geo_uv["sig"]]
-            u, v = rg.earth_winds(vals.pop("u10_raw"), vals.pop("v10_raw"),
-                                  bool(geo_uv["uvRelativeToGrid"]), bool(geo_uv["iScansNegatively"]))
-            u, v = rg(u), rg(v)
-            vals["wind"] = np.hypot(u, v) * 3.6
-            vals["wind_dir"] = np.mod(np.degrees(np.arctan2(-u, -v)), 360)  # meteorological "from"
-            vals["_u"], vals["_v"] = u, v
-        vals.pop("u10_raw", None)
-        vals.pop("v10_raw", None)
+        if "u10" in uv and "v10" in uv and uv_geo is not None:
+            geo, g = uv_geo
+            u, v = uv["u10"], uv["v10"]
+            if geo["uvRelativeToGrid"]:
+                a = g["alpha"] + (np.pi if geo["iScansNegatively"] else 0.0)
+                ca, sa = np.cos(a), np.sin(a)
+                u, v = u * ca - v * sa, u * sa + v * ca
+            vals["u"], vals["v"] = (g["gid"], u), (g["gid"], v)
+            vals["wind"] = (g["gid"], np.hypot(u, v) * 3.6)
 
         stamp = t.strftime("%Y%m%d%H%M")
-        layers = []
-        for key in ("rain", "temp", "cloud", "gust", "vis", "snow", "lightning"):
-            if key in vals:
-                (run_dir / f"{key}_{stamp}.png").write_bytes(_png(LAYERS[key]["scale"].colorize(vals[key])))
-                layers.append(key)
-        if "wind" in vals:
-            (run_dir / f"wind_{stamp}.png").write_bytes(wind_png(vals["wind"], vals["_u"], vals["_v"]))
-            layers.append("wind")
-        if "msl" in vals:
-            (run_dir / f"msl_{stamp}.json").write_text(json.dumps(isobars(vals["msl"], grid)))
-            layers.append("msl")
-        store = {k: vals[k][::INSPECT_STEP, ::INSPECT_STEP].astype(np.float16)
-                 for k in ("rain", "temp", "cloud", "wind", "wind_dir", "msl", "gust", "vis", "snow", "lightning")
-                 if k in vals}
-        for k in ("gust", "vis", "snow", "lightning"):   # value ranges, handy for tuning scales
-            if k in vals and np.isfinite(vals[k]).any():
-                lo, hi = float(np.nanmin(vals[k])), float(np.nanmax(vals[k]))
-                r = ranges.setdefault(k, [lo, hi])
+        for key, (gid, arr) in vals.items():
+            np.save(fdir / f"{key}_{stamp}.npy", arr.astype(np.float16))
+            layer_grid[key] = gid
+            if key in ("gust", "vis", "snow", "lightning") and np.isfinite(arr).any():
+                lo, hi = float(np.nanmin(arr)), float(np.nanmax(arr))
+                r = ranges.setdefault(key, [lo, hi])
                 r[0], r[1] = min(r[0], lo), max(r[1], hi)
-        if store:
-            np.savez_compressed(run_dir / f"values_{stamp}.npz", **store)
+        if "msl" in vals:
+            g = next(g for g in grids.values() if g["gid"] == vals["msl"][0])
+            (run_dir / f"msl_{stamp}.json").write_text(json.dumps(_isobars(vals["msl"][1], g["lats"], g["lons"])))
+        layers = [k for k in ("rain", "temp", "cloud", "wind", "gust", "vis", "snow", "lightning", "msl") if k in vals]
         if layers:
             frames.append({"valid": t.isoformat(), "stamp": stamp, "layers": layers})
 
+    bboxes = {g["gid"]: g["sampler"].bbox for g in grids.values()}
+    union = [min(b[0] for b in bboxes.values()), min(b[1] for b in bboxes.values()),
+             max(b[2] for b in bboxes.values()), max(b[3] for b in bboxes.values())] if bboxes else None
     index = {
         "run": run.isoformat(),
         "run_id": run.strftime("%Y%m%d%H"),
-        "bounds": grid.bounds,
+        "bbox": union,
+        "grids": bboxes,
+        "layer_grid": layer_grid,
         "frames": frames,
         "legends": {k: v["scale"].legend() for k, v in LAYERS.items()},
         "ranges": {k: [round(v[0], 4), round(v[1], 4)] for k, v in ranges.items()},
@@ -448,17 +403,60 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
     return index
 
 
-def inspect(run_dir: Path, stamp: str, lat: float, lon: float, grid: MercGrid = NWP_GRID) -> dict | None:
-    f = run_dir / f"values_{stamp}.npz"
-    px = grid.lonlat_to_pixel(lon, lat)
-    if not f.exists() or px is None:
+# ---------------------------------------------------------------- reading back
+
+@lru_cache(maxsize=8)
+def _grid(run_dir: str, gid: str) -> GridSampler:
+    return GridSampler.load(Path(run_dir), gid)
+
+
+@lru_cache(maxsize=96)
+def _field(path: str) -> np.ndarray:
+    return np.load(path).astype(np.float32)
+
+
+def field(run_dir: Path, key: str, stamp: str) -> np.ndarray | None:
+    f = run_dir / "fields" / f"{key}_{stamp}.npy"
+    return _field(str(f)) if f.exists() else None
+
+
+def render_tile(run_dir: Path, index: dict, layer: str, stamp: str, z: int, x: int, y: int) -> bytes:
+    gid = index.get("layer_grid", {}).get(layer)
+    if gid is None or layer not in LAYERS:
+        return tiles.EMPTY
+    g = _grid(str(run_dir), gid)
+    if not tiles.intersects(z, x, y, g.bbox):
+        return tiles.EMPTY
+    lat, lon = tiles.tile_latlon(z, x, y)
+    fj, fi = g.frac(lat, lon)
+    arr = field(run_dir, layer, stamp)
+    if arr is None:
+        return tiles.EMPTY
+    vals = bilinear(arr, fj, fi)
+    rgba = LAYERS[layer]["scale"].colorize(vals)
+    if layer == "wind":
+        u, v = field(run_dir, "u", stamp), field(run_dir, "v", stamp)
+        if u is not None and v is not None:
+            rgba = tiles.draw_arrows(np.ascontiguousarray(rgba), vals, bilinear(u, fj, fi), bilinear(v, fj, fi))
+    return tiles.encode(rgba)
+
+
+def inspect(run_dir: Path, stamp: str, lat: float, lon: float) -> dict | None:
+    idx_path = run_dir / "index.json"
+    if not idx_path.exists():
         return None
-    c, r = px[0] // INSPECT_STEP, px[1] // INSPECT_STEP
+    index = json.loads(idx_path.read_text())
     out = {}
-    with np.load(f) as z:
-        for k in z.files:
-            a = z[k]
-            if r < a.shape[0] and c < a.shape[1]:
-                val = float(a[r, c])
-                out[k] = None if not math.isfinite(val) else round(val, 1)
+    for key in ("rain", "temp", "cloud", "wind", "u", "v", "msl", "gust", "vis", "snow", "lightning"):
+        gid = index.get("layer_grid", {}).get(key)
+        arr = field(run_dir, key, stamp) if gid else None
+        if arr is None:
+            continue
+        v = float(_grid(str(run_dir), gid).sample(arr, np.array([lat]), np.array([lon]))[0])
+        out[key] = None if not math.isfinite(v) else round(v, 1)
+    if not any(v is not None for v in out.values()):
+        return None
+    u, v = out.pop("u", None), out.pop("v", None)
+    if u is not None and v is not None:
+        out["wind_dir"] = round(math.degrees(math.atan2(-u, -v)) % 360)
     return out

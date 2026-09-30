@@ -7,6 +7,7 @@ stronger echo where they overlap and convert dBZ to rain rate."""
 from __future__ import annotations
 
 import io
+import math
 import logging
 import re
 from dataclasses import dataclass
@@ -121,7 +122,7 @@ def read_sweep(src: str | Path | bytes) -> Sweep:
         if nodata is not None:
             dbz[raw == nodata] = np.nan
         if undetect is not None:
-            dbz[raw == undetect] = np.nan
+            dbz[raw == undetect] = -32.0   # scanned, no echo (keeps edges crisp when interpolating)
 
         rscale = float(_attr(ds_where, "rscale", 1000.0))
         rstart = float(_attr(ds_where, "rstart", 0.0)) * 1000.0  # km -> m
@@ -188,6 +189,49 @@ def render_coverage_png(mask: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def site_meta(s: Sweep) -> dict:
+    return {"lat": s.lat, "lon": s.lon, "rscale": s.rscale, "rstart": s.rstart,
+            "nrays": s.nrays, "nbins": s.nbins, "source": s.source}
+
+
+def sample_polar(dbz: np.ndarray, m: dict, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """Bilinear sample of a polar sweep (rays x bins) at lat/lon; NaN outside range."""
+    nrays, nbins = dbz.shape
+    dist, brg = great_circle(m["lat"], m["lon"], lat, lon)
+    fr = brg / 360.0 * nrays - 0.5
+    fb = (dist - m["rstart"]) / m["rscale"] - 0.5
+    inside = (dist >= m["rstart"]) & (dist < m["rstart"] + nbins * m["rscale"])
+    r0 = np.floor(fr).astype(np.int64)
+    wr = fr - r0
+    r0 %= nrays
+    r1 = (r0 + 1) % nrays
+    fbc = np.clip(fb, 0, nbins - 1)
+    b0 = np.minimum(np.floor(fbc).astype(np.int64), nbins - 2)
+    wb = fbc - b0
+    b1 = b0 + 1
+    acc = np.zeros(lat.shape)
+    wsum = np.zeros(lat.shape)
+    for rr, bb, w in ((r0, b0, (1 - wr) * (1 - wb)), (r1, b0, wr * (1 - wb)),
+                      (r0, b1, (1 - wr) * wb), (r1, b1, wr * wb)):
+        v = dbz[rr, bb].astype(np.float64)
+        good = np.isfinite(v)
+        acc += np.where(good, v * w, 0)
+        wsum += np.where(good, w, 0)
+    out = np.where((wsum > 0.3) & inside, acc / np.maximum(wsum, 1e-9), np.nan)
+    return out.astype(np.float32)
+
+
+def in_range(m: dict, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    dist, _ = great_circle(m["lat"], m["lon"], lat, lon)
+    return (dist >= m["rstart"]) & (dist < m["rstart"] + m["nbins"] * m["rscale"])
+
+
+def site_bbox(m: dict) -> list[float]:
+    r_deg = (m["rstart"] + m["nbins"] * m["rscale"]) / 111_000
+    return [m["lon"] - r_deg / math.cos(math.radians(m["lat"])), m["lat"] - r_deg,
+            m["lon"] + r_deg / math.cos(math.radians(m["lat"])), m["lat"] + r_deg]
+
+
 def slot_of(t: datetime) -> datetime:
     return t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)
 
@@ -243,40 +287,53 @@ def read_cartesian(src: str | Path | bytes) -> Cartesian:
                          xscale=float(_attr(where, "xscale", 1.0)), yscale=float(_attr(where, "yscale", 1.0)))
 
 
-def _cart_lookup(c: Cartesian, grid: MercGrid):
+def cart_mapping(c: Cartesian) -> dict:
+    """How to turn lat/lon into fractional (row, col) in a cartesian product."""
+    cn = c.corners
+    h, w = c.values.shape
     from .proj import forward
 
-    lat2d, lon2d = grid.mesh
-    h, w = c.values.shape
     fwd = forward(c.projdef) if c.projdef else None
-    cn = c.corners
     if fwd is not None and all(f"{k}_lat" in cn for k in ("UL", "UR", "LL", "LR")):
         # Fit projected corner positions to pixel edges. This absorbs the small
         # sphere-vs-ellipsoid error of our projection maths (~0.1 px vs pyproj).
         src = np.array([fwd(cn[f"{k}_lat"], cn[f"{k}_lon"]) for k in ("UL", "UR", "LL", "LR")], dtype=float)
-        dst = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=float)
+        dst = np.array([[0, 0], [0, w], [h, 0], [h, w]], dtype=float)  # (row, col) of pixel edges
         coef, *_ = np.linalg.lstsq(np.c_[src, np.ones(4)], dst, rcond=None)
-        x, y = fwd(lat2d, lon2d)
-        col = np.floor(x * coef[0, 0] + y * coef[1, 0] + coef[2, 0]).astype(np.int64)
-        row = np.floor(x * coef[0, 1] + y * coef[1, 1] + coef[2, 1]).astype(np.int64)
-    elif fwd is not None and "UL_lat" in cn:
-        x0, y0 = fwd(cn["UL_lat"], cn["UL_lon"])
-        x, y = fwd(lat2d, lon2d)
-        col = np.floor((x - x0) / c.xscale).astype(np.int64)
-        row = np.floor((y0 - y) / c.yscale).astype(np.int64)
-    else:  # unknown projection: interpolate linearly between the corners
-        log.warning("radar product projection %r not supported, using corner interpolation", c.projdef)
-        col = np.floor((lon2d - cn["UL_lon"]) / (cn["UR_lon"] - cn["UL_lon"]) * w).astype(np.int64)
-        row = np.floor((cn["UL_lat"] - lat2d) / (cn["UL_lat"] - cn["LL_lat"]) * h).astype(np.int64)
-    inside = (col >= 0) & (col < w) & (row >= 0) & (row < h)
-    return np.clip(row, 0, h - 1), np.clip(col, 0, w - 1), inside
+        return {"kind": "affine", "projdef": c.projdef, "coef": coef.tolist(), "shape": [h, w]}
+    log.warning("radar product projection %r not supported, using corner interpolation", c.projdef)
+    return {"kind": "corners", "corners": cn, "shape": [h, w]}
+
+
+def cart_frac(m: dict, lat, lon):
+    """Fractional (row, col) at pixel centres convention (0 = centre of first pixel)."""
+    if m["kind"] == "affine":
+        from .proj import forward
+
+        x, y = forward(m["projdef"])(lat, lon)
+        c = np.array(m["coef"])
+        row = x * c[0, 0] + y * c[1, 0] + c[2, 0]
+        col = x * c[0, 1] + y * c[1, 1] + c[2, 1]
+    else:
+        cn, (h, w) = m["corners"], m["shape"]
+        col = (lon - cn["UL_lon"]) / (cn["UR_lon"] - cn["UL_lon"]) * w
+        row = (cn["UL_lat"] - lat) / (cn["UL_lat"] - cn["LL_lat"]) * h
+    return row - 0.5, col - 0.5
+
+
+def cart_bbox(m: dict, corners: dict) -> list[float]:
+    lats = [corners[f"{k}_lat"] for k in ("UL", "UR", "LL", "LR") if f"{k}_lat" in corners]
+    lons = [corners[f"{k}_lon"] for k in ("UL", "UR", "LL", "LR") if f"{k}_lon" in corners]
+    return [min(lons) - 0.5, min(lats) - 0.3, max(lons) + 0.5, max(lats) + 0.3]
 
 
 def resample_cartesian(c: Cartesian, grid: MercGrid = RADAR_GRID) -> np.ndarray:
-    row, col, inside = _cart_lookup(c, grid)
-    out = c.values[row, col]
-    out[~inside] = np.nan
-    if c.quantity in REFLECTIVITY:  # accumulation given as reflectivity: convert to mm/h
+    from .grids import bilinear
+
+    lat2d, lon2d = grid.mesh
+    row, col = cart_frac(cart_mapping(c), lat2d, lon2d)
+    out = bilinear(c.values, row, col)
+    if c.quantity in REFLECTIVITY:
         out = dbz_to_rate(out)
     return out
 
