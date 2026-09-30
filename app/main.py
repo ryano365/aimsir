@@ -187,6 +187,35 @@ def _process_nwp(force: bool = False) -> str | None:
     return run_id
 
 
+NWP_NAME = re.compile(r"fc(\d{10})\+(\d{3})")  # fc<run yyyymmddhh>+<lead hours>...
+
+
+def plan_nwp_downloads(listing: list[dict], rx: re.Pattern, have: set[str], current_run: str | None,
+                       max_hours: int, run_every: int, keep_runs: int = 2) -> list[dict]:
+    """Choose which near-realtime NWP files to fetch: matching the regex, not already here,
+    from the newest `keep_runs` runs (every `run_every` hours, never older than the run on
+    screen), lead time <= max_hours. Newest run first, then in lead-time order."""
+    picked = []
+    for it in listing:
+        name = str(it.get("name", ""))
+        if not rx.search(name) or name in have:
+            continue
+        m = NWP_NAME.search(name)
+        if not m:
+            picked.append(("", 0, it))
+            continue
+        run_id, lead = m.group(1), int(m.group(2))
+        if lead > max_hours or int(run_id[-2:]) % max(run_every, 1):
+            continue
+        if current_run and run_id < current_run:
+            continue
+        picked.append((run_id, lead, it))
+    runs = sorted({r for r, _, _ in picked if r}, reverse=True)[:keep_runs]
+    picked = [p for p in picked if not p[0] or p[0] in runs]
+    picked.sort(key=lambda p: (p[0], -p[1]), reverse=True)
+    return [p[2] for p in picked]
+
+
 async def nwp_loop(client: MetClient | None):
     rx = re.compile(settings.nwp_file_regex)
     max_bytes = settings.nwp_max_file_mb * 1024 * 1024
@@ -197,14 +226,13 @@ async def nwp_loop(client: MetClient | None):
             _sweep_inbox()
             if client:
                 listing = await client.list("nwp", _now() - timedelta(hours=3))
-                # newest first, so the latest run is complete before any size limit kicks in
-                listing.sort(key=lambda it: str(it.get("timestamp") or it.get("name")), reverse=True)
+                current = _read_json(NWP_OUT / "current.json", {}).get("run_id")
                 have = {p.name for p in RAW_NWP.iterdir()}
+                todo = plan_nwp_downloads(listing, rx, have, current, settings.nwp_max_hours,
+                                          settings.nwp_run_every_hours)
                 skipped = 0
-                for item in listing:
+                for item in todo:
                     name, size = item["name"], item.get("size") or 0
-                    if not rx.search(name) or name in have:
-                        continue
                     if size and size > max_bytes:
                         skipped += 1
                         continue

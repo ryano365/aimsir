@@ -67,7 +67,7 @@ Met documents the portal API only loosely (see *What I couldn't verify* below), 
 | NWP files are listed | `curl localhost:8080/api/debug/list/nwp?hours=3` (summarised by name pattern; add `&full=true` for everything) |
 | Logs | `docker logs -f aimsir` / `journalctl -u aimsir -f` |
 
-**Tune `NWP_FILE_REGEX` after your first look at the NWP listing.** It defaults to `.*`, which downloads everything published in the last 3 hours. If Met publishes full model output per lead time, that's a lot of data. The app ignores any GRIB message it doesn't need, so narrow the regex to the files that contain surface fields. `NWP_MAX_FILE_MB` and `NWP_MAX_RAW_GB` are hard limits in the meantime.
+**Model downloads.** Met's near-realtime feed holds ~3,300 files (~180 GB) at any time: every run, every lead hour, split into model-level, pressure-level and surface bundles over several domains, plus ensemble files. The app only takes `fc<run>+<lead>CONTROL_grib2_ieIoI`: the control run's surface fields cropped to the Island of Ireland, about 14 MB per hour. It fetches one run every `NWP_RUN_EVERY_HOURS` (default 3) out to `NWP_MAX_HOURS` (default 48), so about 0.7 GB every 3 hours. Set `NWP_RUN_EVERY_HOURS=1` if you want every hourly run and don't mind ~16 GB a day of downloads.
 
 ## Configuration
 
@@ -81,8 +81,10 @@ All settings are environment variables. `.env.example` lists them with comments.
 | `RADAR_FILE_REGEX` | `T_PAGZ4[01]_.*\.h5$` | 40 = Shannon, 41 = Dublin instantaneous volumes |
 | `RADAR_MIN_DBZ` | `7` | Hide echoes weaker than this (≈0.1 mm/h). Raise it if you see clutter |
 | `RADAR_HISTORY_MINUTES` | `120` | Length of the radar loop |
-| `NWP_MAX_HOURS` | `60` | How far ahead to render |
-| `NWP_FILE_REGEX`, `NWP_MAX_FILE_MB`, `NWP_MAX_RAW_GB` | `.*`, 1500, 8 | See above |
+| `NWP_MAX_HOURS` | `48` | How far ahead to render |
+| `NWP_FILE_REGEX` | `CONTROL_grib2_ieIoI$` | Which model files to fetch (see above) |
+| `NWP_RUN_EVERY_HOURS` | `3` | Fetch a run every N hours |
+| `NWP_MAX_FILE_MB`, `NWP_MAX_RAW_GB` | 1500, 8 | Safety limits |
 
 ## How it works
 

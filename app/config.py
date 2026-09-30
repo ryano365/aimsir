@@ -57,10 +57,12 @@ class Settings:
 
     # NWP (HARMONIE-AROME GRIB)
     nwp_poll_s: int = field(default_factory=lambda: _int("NWP_POLL_SECONDS", 900))
-    nwp_file_regex: str = field(default_factory=lambda: _env("NWP_FILE_REGEX", r".*"))
+    nwp_file_regex: str = field(default_factory=lambda: _env("NWP_FILE_REGEX", r"CONTROL_grib2_ieIoI$"))
     nwp_max_file_mb: int = field(default_factory=lambda: _int("NWP_MAX_FILE_MB", 1500))
     nwp_max_raw_gb: float = field(default_factory=lambda: _float("NWP_MAX_RAW_GB", 8))
-    nwp_max_hours: int = field(default_factory=lambda: _int("NWP_MAX_HOURS", 60))
+    nwp_max_hours: int = field(default_factory=lambda: _int("NWP_MAX_HOURS", 48))
+    # DINI runs hourly; only fetch runs starting every N hours (1 = every run, ~0.7 GB each)
+    nwp_run_every_hours: int = field(default_factory=lambda: _int("NWP_RUN_EVERY_HOURS", 3))
 
     forecast_cache_s: int = field(default_factory=lambda: _int("FORECAST_CACHE_SECONDS", 1800))
 
