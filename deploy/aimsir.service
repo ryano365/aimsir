@@ -1,0 +1,18 @@
+# Plain systemd unit for running without Docker (e.g. a Debian/Ubuntu LXC).
+#   Installed by deploy/install.sh - see README.
+[Unit]
+Description=Aimsir weather viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=aimsir
+WorkingDirectory=/opt/aimsir
+EnvironmentFile=/opt/aimsir/.env
+Environment=DATA_DIR=/opt/aimsir/data INBOX_DIR=/opt/aimsir/data/inbox
+ExecStart=/opt/aimsir/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips=*
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,192 @@
+"""Decode Met Éireann ODIM-HDF5 radar volumes and render composite frames.
+
+Met publishes polar volume scans (object=PVOL) from Dublin and Shannon every
+5 minutes. For a rain map we take the lowest elevation sweep of reflectivity
+from each site, resample both onto the Mercator output grid, keep the
+stronger echo where they overlap and convert dBZ to rain rate."""
+from __future__ import annotations
+
+import io
+import logging
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+
+import h5py
+import numpy as np
+from PIL import Image
+
+from .geo import RADAR_GRID, MercGrid, great_circle
+from .palettes import RAIN, dbz_to_rate
+
+log = logging.getLogger(__name__)
+
+TS_RE = re.compile(r"(\d{14})")
+REFLECTIVITY = ("DBZH", "TH", "DBZ", "DBZV", "TV")
+
+
+@dataclass
+class Sweep:
+    source: str
+    lat: float
+    lon: float
+    time: datetime
+    elangle: float
+    rscale: float      # m per bin
+    rstart: float      # m to start of first bin
+    dbz: np.ndarray    # (nrays, nbins), NaN = no data
+
+    @property
+    def nrays(self) -> int:
+        return self.dbz.shape[0]
+
+    @property
+    def nbins(self) -> int:
+        return self.dbz.shape[1]
+
+
+def _attr(group, name, default=None):
+    if group is None or name not in group.attrs:
+        return default
+    v = group.attrs[name]
+    if isinstance(v, bytes):
+        return v.decode("ascii", "replace")
+    if isinstance(v, np.ndarray) and v.size == 1:
+        v = v.item()
+        if isinstance(v, bytes):
+            return v.decode("ascii", "replace")
+    return v
+
+
+def _odim_time(date, time) -> datetime | None:
+    try:
+        return datetime.strptime(f"{date}{str(time)[:6]}", "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def file_time(name: str) -> datetime | None:
+    m = TS_RE.search(name)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+
+
+def read_sweep(src: str | Path | bytes) -> Sweep:
+    """Lowest-elevation reflectivity sweep from an ODIM PVOL/SCAN file."""
+    fh = h5py.File(io.BytesIO(src) if isinstance(src, bytes) else src, "r")
+    with fh as f:
+        what, where = f.get("what"), f.get("where")
+        obj = str(_attr(what, "object", "PVOL")).upper()
+        if obj not in ("PVOL", "SCAN"):
+            raise ValueError(f"unsupported ODIM object {obj!r} (only polar volumes/scans are rendered)")
+        lat, lon = float(_attr(where, "lat")), float(_attr(where, "lon"))
+        source = str(_attr(what, "source", ""))
+        root_time = _odim_time(_attr(what, "date"), _attr(what, "time"))
+
+        best = None  # (elangle, dataset, data group, quantity rank)
+        for ds_name in sorted(k for k in f.keys() if k.startswith("dataset")):
+            ds = f[ds_name]
+            ds_what, ds_where = ds.get("what"), ds.get("where")
+            el = _attr(ds_where, "elangle")
+            if el is None:
+                continue
+            for d_name in sorted(k for k in ds.keys() if k.startswith("data")):
+                d = ds[d_name]
+                q = str(_attr(d.get("what"), "quantity", _attr(ds_what, "quantity", ""))).upper()
+                if q not in REFLECTIVITY or "data" not in d:
+                    continue
+                rank = REFLECTIVITY.index(q)
+                key = (float(el), rank)
+                if best is None or key < (best[0], best[3]):
+                    best = (float(el), ds, d, rank)
+        if best is None:
+            raise ValueError("no reflectivity quantity found in file")
+
+        el, ds, d, _ = best
+        ds_what, ds_where, d_what = ds.get("what"), ds.get("where"), d.get("what")
+
+        def pick(name, default):
+            v = _attr(d_what, name)
+            if v is None:
+                v = _attr(ds_what, name, default)
+            return v
+
+        gain, offset = float(pick("gain", 1.0)), float(pick("offset", 0.0))
+        nodata, undetect = pick("nodata", None), pick("undetect", None)
+        raw = d["data"][()]
+        dbz = raw.astype(np.float32) * gain + offset
+        if nodata is not None:
+            dbz[raw == nodata] = np.nan
+        if undetect is not None:
+            dbz[raw == undetect] = np.nan
+
+        rscale = float(_attr(ds_where, "rscale", 1000.0))
+        rstart = float(_attr(ds_where, "rstart", 0.0)) * 1000.0  # km -> m
+        t = _odim_time(_attr(ds_what, "startdate"), _attr(ds_what, "starttime")) or root_time
+        return Sweep(source=source, lat=lat, lon=lon, time=t or datetime.now(timezone.utc),
+                     elangle=el, rscale=rscale, rstart=rstart, dbz=dbz)
+
+
+@lru_cache(maxsize=8)
+def _polar_lookup(lat: float, lon: float, nrays: int, nbins: int, rscale: float, rstart: float,
+                  grid: MercGrid = RADAR_GRID):
+    """For each output pixel: (ray index, bin index, inside-range mask)."""
+    lat2d, lon2d = grid.mesh
+    dist, brg = great_circle(lat, lon, lat2d, lon2d)
+    ray = np.floor(brg / 360.0 * nrays).astype(np.int32) % nrays
+    b = np.floor((dist - rstart) / rscale).astype(np.int32)
+    inside = (b >= 0) & (b < nbins)
+    b = np.clip(b, 0, nbins - 1)
+    return ray, b, inside
+
+
+def resample(sweep: Sweep, grid: MercGrid = RADAR_GRID) -> np.ndarray:
+    ray, b, inside = _polar_lookup(round(sweep.lat, 5), round(sweep.lon, 5), sweep.nrays, sweep.nbins,
+                                   sweep.rscale, sweep.rstart, grid)
+    out = sweep.dbz[ray, b]
+    out[~inside] = np.nan
+    return out
+
+
+def composite(sweeps: list[Sweep], grid: MercGrid = RADAR_GRID) -> np.ndarray:
+    out = np.full((grid.height, grid.width), np.nan, dtype=np.float32)
+    for s in sweeps:
+        out = np.fmax(out, resample(s, grid))
+    return out
+
+
+def coverage_mask(sweeps: list[Sweep], grid: MercGrid = RADAR_GRID) -> np.ndarray:
+    """True where at least one radar can see (used to shade 'no coverage')."""
+    m = np.zeros((grid.height, grid.width), dtype=bool)
+    for s in sweeps:
+        m |= _polar_lookup(round(s.lat, 5), round(s.lon, 5), s.nrays, s.nbins, s.rscale, s.rstart, grid)[2]
+    return m
+
+
+def render_png(dbz: np.ndarray, min_dbz: float) -> bytes:
+    d = np.where(dbz >= min_dbz, dbz, np.nan)
+    rgba = RAIN.colorize(dbz_to_rate(d))
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_coverage_png(mask: np.ndarray) -> bytes:
+    """Faint hatch outside radar range so 'no rain' and 'no data' differ."""
+    h, w = mask.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    hatch = ((xx + yy) % 9 == 0)
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    out = ~mask
+    rgba[out] = (60, 64, 70, 28)
+    rgba[out & hatch] = (60, 64, 70, 70)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def slot_of(t: datetime) -> datetime:
+    return t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Aimsir</title>
+<meta name="theme-color" content="#f3f1ea" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16181a" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.5' fill='none' stroke='%23c2410c' stroke-width='1.5'/%3E%3Ccircle cx='8' cy='8' r='1.6' fill='%23c2410c'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<aside id="side">
+  <header class="masthead">
+    <div class="wordmark">Aimsir</div>
+    <div class="status" id="status"></div>
+  </header>
+
+  <div id="warnings"></div>
+
+  <section class="now">
+    <div class="place">
+      <select id="place" aria-label="Location"></select>
+    </div>
+    <div class="now-main">
+      <div class="now-temp" id="now-temp">–</div>
+      <div class="now-glyph" id="now-glyph"></div>
+    </div>
+    <div class="now-desc" id="now-desc">&nbsp;</div>
+    <dl class="now-grid" id="now-grid"></dl>
+  </section>
+
+  <section>
+    <h2>Next 48 hours</h2>
+    <div id="meteogram" class="meteogram"></div>
+  </section>
+
+  <section>
+    <h2>Coming days</h2>
+    <ol id="days" class="days"></ol>
+  </section>
+
+  <footer class="credits">
+    <p>Radar and forecast data © Met Éireann, <a href="https://www.met.ie" target="_blank" rel="noopener">met.ie</a>.
+    Published under <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
+    Met Éireann does not accept any liability whatsoever for any error or omission in the data, their availability,
+    or for any loss or damage arising from their use.</p>
+  </footer>
+</aside>
+
+<main id="stage">
+  <div id="map"></div>
+
+  <div class="panel layers" id="layers">
+    <div class="group-label">Observed</div>
+    <label class="layer"><input type="radio" name="layer" value="radar" checked><span>Radar</span><em>last 2 h</em></label>
+    <div class="group-label">Model <span id="run-label"></span></div>
+    <label class="layer"><input type="radio" name="layer" value="rain"><span>Rain</span></label>
+    <label class="layer"><input type="radio" name="layer" value="temp"><span>Temperature</span></label>
+    <label class="layer"><input type="radio" name="layer" value="wind"><span>Wind</span></label>
+    <label class="layer"><input type="radio" name="layer" value="cloud"><span>Cloud</span></label>
+    <hr>
+    <label class="toggle"><input type="checkbox" id="isobars"><span>Isobars</span></label>
+  </div>
+
+  <div class="panel legend" id="legend"></div>
+
+  <div class="panel timeline" id="timeline">
+    <button class="play" id="play" aria-label="Play">
+      <svg viewBox="0 0 16 16" class="i-play"><path d="M4 2.5v11l9-5.5z"/></svg>
+      <svg viewBox="0 0 16 16" class="i-pause"><path d="M4 2.5h3v11H4zM9 2.5h3v11H9z"/></svg>
+    </button>
+    <div class="clock"><span id="t-day"></span><strong id="t-time">--:--</strong></div>
+    <div class="track" id="track"><div class="ticks" id="ticks"></div><div class="head" id="head"></div></div>
+  </div>
+
+  <div class="empty" id="empty" hidden></div>
+</main>
+
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<script src="/static/glyphs.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
