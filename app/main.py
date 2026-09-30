@@ -253,6 +253,7 @@ def config():
     return {
         "home": {"name": settings.home_name, "lat": settings.home_lat, "lon": settings.home_lon},
         "has_key": bool(settings.api_key),
+        "basemap": settings.basemap,
     }
 
 
@@ -316,20 +317,40 @@ async def get_warnings():
 
 
 @app.get("/api/debug/list/{dataset}")
-async def debug_list(dataset: str, hours: float = 3):
-    """Raw near-realtime listing - handy for tuning RADAR_FILE_REGEX / NWP_FILE_REGEX."""
+async def debug_list(dataset: str, hours: float = 3, full: bool = False):
+    """Near-realtime listing, summarised by file-name pattern (digits -> #).
+    Handy for tuning RADAR_FILE_REGEX / NWP_FILE_REGEX. ?full=true for the raw list."""
     if dataset not in ("radar", "nwp"):
         raise HTTPException(404)
     if not app.state.met:
         raise HTTPException(400, "MET_API_KEY not set")
     try:
-        return await app.state.met.list(dataset, _now() - timedelta(hours=hours))
+        items = await app.state.met.list(dataset, _now() - timedelta(hours=hours))
     except (MetError, httpx.HTTPError) as e:
         return JSONResponse({"error": str(e)}, status_code=502)
+    if full:
+        return items
+    groups: dict[str, dict] = {}
+    for it in items:
+        name = str(it.get("name", ""))
+        g = groups.setdefault(re.sub(r"\d", "#", name), {"count": 0, "bytes": 0, "examples": []})
+        g["count"] += 1
+        g["bytes"] += int(it.get("size") or 0)
+        if len(g["examples"]) < 3:
+            g["examples"].append(name)
+    patterns = sorted(groups.items(), key=lambda kv: -kv[1]["count"])
+    return {
+        "files": len(items),
+        "total_mb": round(sum(g["bytes"] for g in groups.values()) / 1e6, 1),
+        "patterns": [{"pattern": k, "count": v["count"], "total_mb": round(v["bytes"] / 1e6, 1),
+                      "examples": v["examples"]} for k, v in patterns[:40]],
+        "sample_item": items[0] if items else None,
+    }
 
 
 @app.post("/api/debug/reprocess")
 async def reprocess():
+    _sweep_inbox()
     await asyncio.to_thread(_render_radar)
     run = await asyncio.to_thread(_process_nwp, True)
     return {"radar": "ok", "nwp_run": run}

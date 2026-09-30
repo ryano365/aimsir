@@ -135,6 +135,7 @@ h2 {
 .leaflet-control-attribution a { color: var(--ink-2); }
 .leaflet-bar a { background: var(--panel); color: var(--ink); border-color: var(--rule); }
 .leaflet-bar { border: 1px solid var(--rule) !important; box-shadow: none !important; border-radius: 2px; }
+.osm-dark { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) grayscale(.4); }
 .leaflet-overlay-pane img.wx { image-rendering: auto; transition: opacity .12s linear; }
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--paper); color: var(--ink); border-radius: 2px; box-shadow: 0 1px 0 var(--rule), 0 6px 22px rgba(0,0,0,.18); }
 .leaflet-popup-content { margin: 10px 12px; font-size: 12.5px; }

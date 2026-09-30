@@ -64,7 +64,7 @@ Met documents the portal API only loosely (see *What I couldn't verify* below), 
 |---|---|
 | Key works | `curl localhost:8080/api/status`: `error` should be `null` for both feeds |
 | Radar files are listed | `curl localhost:8080/api/debug/list/radar?hours=1` |
-| NWP files are listed | `curl localhost:8080/api/debug/list/nwp?hours=3` |
+| NWP files are listed | `curl localhost:8080/api/debug/list/nwp?hours=3` (summarised by name pattern; add `&full=true` for everything) |
 | Logs | `docker logs -f aimsir` / `journalctl -u aimsir -f` |
 
 **Tune `NWP_FILE_REGEX` after your first look at the NWP listing.** It defaults to `.*`, which downloads everything published in the last 3 hours. If Met publishes full model output per lead time, that's a lot of data. The app ignores any GRIB message it doesn't need, so narrow the regex to the files that contain surface fields. `NWP_MAX_FILE_MB` and `NWP_MAX_RAW_GB` are hard limits in the meantime.
@@ -77,6 +77,7 @@ All settings are environment variables. `.env.example` lists them with comments.
 |---|---|---|
 | `MET_API_KEY` | – | Portal key. Without it, only files dropped in the inbox are shown |
 | `HOME_NAME`, `HOME_LAT`, `HOME_LON` | Dublin | Default forecast location (the browser remembers your own pick) |
+| `BASEMAP` | `openfreemap` | `openfreemap` (free vector tiles, no key), `osm` (openstreetmap.org raster) or `none` (bundled coastline only, no external requests) |
 | `RADAR_FILE_REGEX` | `T_PAGZ4[01]_.*\.h5$` | 40 = Shannon, 41 = Dublin instantaneous volumes |
 | `RADAR_MIN_DBZ` | `7` | Hide echoes weaker than this (≈0.1 mm/h). Raise it if you see clutter |
 | `RADAR_HISTORY_MINUTES` | `120` | Length of the radar loop |
@@ -123,4 +124,4 @@ If something doesn't show up, the debug listing plus one sample file is usually 
 
 Radar, NWP, forecast and warnings data: **Copyright Met Éireann. Source: met.ie. Licence: CC BY 4.0.** Met Éireann does not accept any liability whatsoever for any error or omission in the data, their availability, or for any loss or damage arising from their use. The app shows this attribution in the sidebar. Met's forecast-API licence also requires sites that display its forecasts publicly to show Met's warnings, which the app does.
 
-Basemap © OpenStreetMap contributors © CARTO. Coastline from Natural Earth (public domain). IBM Plex fonts (OFL). Leaflet (BSD-2).
+Basemap: [OpenFreeMap](https://openfreemap.org) © OpenMapTiles, data © OpenStreetMap contributors (rendered with MapLibre GL, BSD-3). Coastline from Natural Earth (public domain). IBM Plex fonts (OFL). Leaflet (BSD-2).

@@ -45,17 +45,78 @@
   map.createPane("isobars").style.zIndex = 430;
   map.createPane("coast").style.zIndex = 425;
   map.getPane("coast").style.pointerEvents = "none";
+  map.attributionControl.setPrefix(false);
+  map.attributionControl.addAttribution('Weather © <a href="https://www.met.ie">Met Éireann</a>');
+  window.aimsirMap = map; // handy from the dev console
+
+  // Natural Earth coastline (bundled). Drawn over model layers, and always when there is no basemap.
   let coast = null;
+  let coastAlways = false;
+  const syncCoast = () => {
+    if (!coast) return;
+    const want = coastAlways || S.mode !== "radar";
+    if (want && !map.hasLayer(coast)) coast.addTo(map);
+    if (!want && map.hasLayer(coast)) map.removeLayer(coast);
+  };
   fetch("/static/coast.json").then((r) => r.json()).then((gj) => {
     coast = L.geoJSON(gj, { pane: "coast", interactive: false, style: { color: dark ? "#e6e3da" : "#1c1f22", weight: 0.7, opacity: 0.55 } });
-    if (S.mode !== "radar") coast.addTo(map);
+    syncCoast();
   }).catch(() => {});
-  const carto = (v) => `https://{s}.basemaps.cartocdn.com/${v}/{z}/{x}/{y}{r}.png`;
-  const attr = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/attributions">CARTO</a> · Weather © <a href="https://www.met.ie">Met Éireann</a>';
-  L.tileLayer(carto(dark ? "dark_nolabels" : "light_nolabels"), { attribution: attr, subdomains: "abcd" }).addTo(map);
-  L.tileLayer(carto(dark ? "dark_only_labels" : "light_only_labels"), { pane: "labels", subdomains: "abcd" }).addTo(map);
-  map.attributionControl.setPrefix(false);
-  window.aimsirMap = map; // handy from the dev console
+
+  const loadAsset = (src) => new Promise((ok, fail) => {
+    const el = src.endsWith(".css") ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
+      : Object.assign(document.createElement("script"), { src });
+    el.onload = ok;
+    el.onerror = () => fail(new Error("failed to load " + src));
+    document.head.appendChild(el);
+  });
+
+  // Basemap: OpenFreeMap vector tiles (free, no key) by default. The style is split in two so
+  // place names sit above the weather overlays: shapes in the tile pane, labels in the labels pane.
+  async function setupBasemap(kind) {
+    if (kind === "openfreemap") {
+      try {
+        await loadAsset("/static/vendor/maplibre/maplibre-gl.css");
+        await loadAsset("/static/vendor/maplibre/maplibre-gl.js");
+        await loadAsset("/static/vendor/maplibre/leaflet-maplibre-gl.js");
+        const r = await fetch(`https://tiles.openfreemap.org/styles/${dark ? "dark" : "positron"}`);
+        if (!r.ok) throw new Error(`style ${r.status}`);
+        const style = await r.json();
+        const part = (keep) => ({ ...style, layers: style.layers.filter(keep) });
+        // Labels sit on top of coloured weather layers, so keep only place/water names
+        // (no road shields or POIs) and give them a firm halo that reads on any overlay.
+        const clutter = /highway|road|poi|shield|transport|aeroway|airport|rail|housenumber|building/i;
+        const labelLayers = style.layers
+          .filter((l) => l.type === "symbol" && !clutter.test(l.id) && l.layout?.["text-field"])
+          .map((l) => ({
+            ...l,
+            layout: { ...l.layout, "icon-image": "", "text-transform": "none", "text-letter-spacing": 0.02 },
+            paint: {
+              ...l.paint,
+              "text-color": dark ? "#e6e3da" : "#2b2e31",
+              "text-halo-color": dark ? "rgba(23,25,27,0.9)" : "rgba(250,249,245,0.92)",
+              "text-halo-width": dark ? 1.1 : 1.4,
+              "text-halo-blur": dark ? 0.6 : 0.2,
+            },
+          }));
+        L.maplibreGL({ style: part((l) => l.type !== "symbol"), interactive: false }).addTo(map);
+        L.maplibreGL({ style: { ...style, layers: labelLayers }, pane: "labels", interactive: false }).addTo(map);
+        return;
+      } catch (e) {
+        console.warn("OpenFreeMap basemap unavailable, falling back to coastline only:", e);
+        kind = "none";
+      }
+    }
+    if (kind === "osm") {
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19, className: dark ? "osm-dark" : "",
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      }).addTo(map);
+      return;
+    }
+    coastAlways = true; // "none": sea-coloured background + bundled coastline, nothing external
+    syncCoast();
+  }
 
   // ------------------------------------------------------------ state
   const S = {
@@ -211,7 +272,7 @@
     drawTicks();
     drawLegend();
     if (S.coverage) S.coverage.setOpacity(mode === "radar" ? 1 : 0);
-    if (coast) mode === "radar" ? map.removeLayer(coast) : coast.addTo(map);
+    syncCoast();
     emptyState();
     if (!S.frames.length) { $("#head").style.left = "0"; updateIsobars(new Date()); return; }
     let target = S.frames.length - 1;
@@ -551,7 +612,8 @@
 
   // ------------------------------------------------------------ boot
   (async function boot() {
-    S.cfg = await getJSON("/api/config").catch(() => ({ home: { name: "Dublin", lat: 53.35, lon: -6.26 }, has_key: false }));
+    S.cfg = await getJSON("/api/config").catch(() => ({ home: { name: "Dublin", lat: 53.35, lon: -6.26 }, has_key: false, basemap: "openfreemap" }));
+    setupBasemap(S.cfg.basemap || "openfreemap");
     if (!S.place) S.place = { name: S.cfg.home.name, lat: S.cfg.home.lat, lon: S.cfg.home.lon, custom: !PLACES.some((p) => p[0] === S.cfg.home.name) };
     setPlace(S.place);
     await Promise.all([refreshStatus(), refreshRadar(), refreshNwp()]);

@@ -35,6 +35,10 @@ class Settings:
     warnings_url: str = field(default_factory=lambda: _env(
         "MET_WARNINGS_URL", "https://www.met.ie/Open_Data/json/warning_IRELAND.json"))
 
+    # Map background: openfreemap (free vector tiles, default), osm (openstreetmap.org raster),
+    # or none (bundled coastline only - no external requests at all)
+    basemap: str = field(default_factory=lambda: _env("BASEMAP", "openfreemap").lower())
+
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "./data")).resolve())
     # Drop .h5 / .grib files in here to have them processed without the API (testing, FTP sync...)
     inbox_dir: Path = field(default_factory=lambda: Path(_env("INBOX_DIR", "./data/inbox")).resolve())
