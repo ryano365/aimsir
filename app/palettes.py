@@ -80,9 +80,11 @@ SNOW = Scale("snow", "Lying snow", "mm w.e.", [
     (0.5, "#eef3fa"), (2, "#d7e3f4"), (5, "#b7c9ea"), (10, "#95a9dc"), (25, "#7a83c6"), (50, "#6a5aa8"),
 ], alpha=[0.7, 0.75, 0.8, 0.85, 0.88, 0.9])
 
-LIGHTNING = Scale("lightning", "Lightning", "model index", [
-    (0.01, "#f6e27a"), (0.1, "#f2c14e"), (0.5, "#ee8434"), (1, "#d6452b"), (2, "#a3206d"), (5, "#5e1a8a"),
-], alpha=[0.55, 0.7, 0.8, 0.88, 0.92, 0.95])
+# HARMONIE lightning diagnostic; Met's live runs peak in the low hundreds, so the
+# steps are roughly logarithmic to keep both isolated flashes and big cells readable.
+LIGHTNING = Scale("lightning", "Lightning", "model flash density", [
+    (0.5, "#f6e27a"), (2, "#f2c14e"), (5, "#ee8434"), (15, "#d6452b"), (40, "#a3206d"), (100, "#5e1a8a"),
+], alpha=[0.5, 0.65, 0.78, 0.86, 0.92, 0.95])
 
 # mm in the hour, radar-estimated
 RAIN_ACC = Scale("radaracc", "Radar rain, last hour", "mm", [

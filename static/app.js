@@ -402,7 +402,7 @@
         ["Gusts", v.gust != null && `${Math.round(v.gust)} km/h`],
         ["Visibility", v.vis != null && (v.vis >= 10 ? "10 km+" : `${v.vis < 1 ? Math.round(v.vis * 1000) + " m" : v.vis.toFixed(1) + " km"}`)],
         ["Snow", v.snow != null && v.snow >= 0.5 && `${v.snow.toFixed(0)} mm w.e.`],
-        ["Lightning", v.lightning != null && v.lightning >= 0.01 && v.lightning.toFixed(2)],
+        ["Lightning", v.lightning != null && v.lightning >= 0.5 && v.lightning.toFixed(v.lightning < 10 ? 1 : 0)],
       ].filter((r) => r[1]);
       pop.setContent(`<div class="pop">${head}<table>${rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>` +
         `<h3 style="margin:6px 0 0">model · ${fDate.format(new Date(best.valid))} ${hm(new Date(best.valid))}</h3>${btn}</div>`);
