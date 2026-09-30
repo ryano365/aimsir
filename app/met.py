@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -50,20 +50,45 @@ class MetClient:
     async def close(self):
         await self.http.aclose()
 
+    FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.000Z")
+
+    async def _list_once(self, url: str, since: datetime, until: datetime, fmt: str) -> httpx.Response:
+        return await self.http.get(url, params={"from": since.strftime(fmt), "to": until.strftime(fmt)})
+
     async def list(self, dataset: str, since: datetime, until: datetime | None = None) -> list[dict]:
+        """List near-realtime files. The portal has been seen returning 500s for some
+        windows, so on failure we try the other date formats, then smaller time slices."""
         until = until or datetime.now(timezone.utc)
         url = f"{settings.api_base}/near-realtime/{dataset}"
-        last = None
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.000Z"):
-            r = await self.http.get(url, params={"from": since.strftime(fmt), "to": until.strftime(fmt)})
-            if r.status_code == 400:
-                last = r
-                continue
+        tried: list[str] = []
+        fmts = ([self._fmt] if getattr(self, "_fmt", None) else []) + [f for f in self.FORMATS if f != getattr(self, "_fmt", None)]
+        for fmt in fmts:
+            r = await self._list_once(url, since, until, fmt)
             if r.status_code in (401, 403):
                 raise MetError(f"{dataset} listing refused ({r.status_code}) - check MET_API_KEY")
-            r.raise_for_status()
-            return _items(r.json())
-        raise MetError(f"{dataset} listing rejected: {last.status_code if last else '?'} {last.text[:200] if last else ''}")
+            if r.status_code == 200:
+                self._fmt = fmt
+                return _items(r.json())
+            tried.append(f"{r.status_code} [{fmt}] {r.text[:120]!r}")
+        # Whole window failed: walk it in 20-minute slices and merge what works.
+        fmt = getattr(self, "_fmt", None) or self.FORMATS[0]
+        items: dict[str, dict] = {}
+        ok = 0
+        t = since
+        while t < until:
+            t2 = min(t + timedelta(minutes=20), until)
+            r = await self._list_once(url, t, t2, fmt)
+            if r.status_code == 200:
+                ok += 1
+                for it in _items(r.json()):
+                    items[it["name"]] = it
+            else:
+                tried.append(f"{r.status_code} slice {t:%H:%M}-{t2:%H:%M}")
+            t = t2
+        if ok:
+            log.info("%s listing: full window failed, %d slices OK, %d files", dataset, ok, len(items))
+            return list(items.values())
+        raise MetError(f"{dataset} listing failed on Met's side: " + " | ".join(tried[:5]))
 
     async def download(self, dataset: str, name: str, dest_dir: Path, max_bytes: int | None = None) -> list[Path]:
         """Download one file; a zip response is unpacked. Returns local paths."""

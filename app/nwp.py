@@ -27,6 +27,7 @@ from .palettes import CLOUD, RAIN, TEMP, WIND
 log = logging.getLogger(__name__)
 
 FIELDS = ("t2", "u10", "v10", "msl", "tp", "tcc")
+CLOUD_LAYERS = ("lcc", "mcc", "hcc")  # used to build total cloud when tcc is absent
 
 
 def _get(h, key, default=None):
@@ -65,6 +66,8 @@ def classify(h) -> str | None:
             return "tp"
         if (cat, num) == (6, 1) and lt not in ("isobaricInhPa", "hybrid"):
             return "tcc"
+        if cat == 6 and num in (3, 4, 5) and lt not in ("isobaricInhPa", "hybrid"):
+            return {3: "lcc", 4: "mcc", 5: "hcc"}[num]
     if sn in ("2t", "t2m") or (sn == "t" and lt == "heightAboveGround" and lev == 2):
         return "t2"
     if sn in ("10u",) or (sn == "u" and lt == "heightAboveGround" and lev == 10):
@@ -77,7 +80,30 @@ def classify(h) -> str | None:
         return "tp"
     if sn == "tcc" and lt not in ("isobaricInhPa", "hybrid"):
         return "tcc"
+    if sn in CLOUD_LAYERS and lt not in ("isobaricInhPa", "hybrid"):
+        return sn
     return None
+
+
+def inventory(path: Path, limit: int = 400) -> list[dict]:
+    """Unique parameter/level combinations in a GRIB file (for debugging)."""
+    seen: dict[tuple, dict] = {}
+    with open(path, "rb") as f:
+        while len(seen) < limit:
+            h = ec.codes_grib_new_from_file(f)
+            if h is None:
+                break
+            try:
+                row = {k: _get(h, k) for k in ("shortName", "name", "typeOfLevel", "level", "stepType",
+                                                 "units", "discipline", "parameterCategory", "parameterNumber",
+                                                 "indicatorOfParameter", "perturbationNumber")}
+                row = {k: v for k, v in row.items() if v is not None}
+                row["used_as"] = classify(h)
+                key = tuple(sorted((k, str(v)) for k, v in row.items()))
+                seen.setdefault(key, row)
+            finally:
+                ec.codes_release(h)
+    return list(seen.values())
 
 
 @dataclass
@@ -323,6 +349,12 @@ def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGri
                 vals["msl"] = rg(raw / 100.0 if np.nanmean(raw) > 2000 else raw)
             elif name == "tcc":
                 vals["cloud"] = rg(raw * 100.0 if np.nanmax(raw) <= 1.01 else raw)
+            elif name in CLOUD_LAYERS:
+                c = rg(raw * 100.0 if np.nanmax(raw) <= 1.01 else raw)
+                vals["_layers"] = c if "_layers" not in vals else np.fmax(vals["_layers"], c)
+        if "cloud" not in vals and "_layers" in vals:
+            vals["cloud"] = vals["_layers"]  # maximum-overlap estimate of total cloud
+        vals.pop("_layers", None)
         if "u10_raw" in vals and "v10_raw" in vals and geo_uv is not None:
             rg = regridders[geo_uv["sig"]]
             u, v = rg.earth_winds(vals.pop("u10_raw"), vals.pop("v10_raw"),

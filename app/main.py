@@ -378,6 +378,17 @@ async def debug_list(dataset: str, hours: float = 3, full: bool = False):
     }
 
 
+@app.get("/api/debug/grib")
+def debug_grib(name: str | None = None, limit: int = 400):
+    """Inventory of one downloaded NWP file: which parameters/levels it holds."""
+    files = sorted(p for p in RAW_NWP.iterdir() if p.is_file() and not p.name.startswith("."))
+    if name:
+        files = [p for p in files if p.name == name]
+    if not files:
+        raise HTTPException(404, "no NWP files downloaded yet")
+    return {"file": files[0].name, "messages": nwp.inventory(files[0], limit)}
+
+
 @app.post("/api/debug/reprocess")
 async def reprocess():
     _sweep_inbox()
