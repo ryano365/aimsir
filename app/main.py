@@ -160,6 +160,9 @@ def _process_nwp(force: bool = False) -> str | None:
     sig = [[p.name, p.stat().st_size] for p in files]
     state = _read_json(NWP_OUT / "current.json", {})
     if not files or (not force and state.get("sig") == sig):
+        for k in ("fields_found", "fields_missing"):
+            if k in state:
+                status["nwp"][k] = state[k]
         return state.get("run_id")
     refs = nwp.scan(files)
     if not refs:
@@ -180,7 +183,9 @@ def _process_nwp(force: bool = False) -> str | None:
         if (t is not None and t < run) or (t is None and time.time() - p.stat().st_mtime > 12 * 3600):
             p.unlink(missing_ok=True)
     sig = [[p.name, p.stat().st_size] for p in sorted(RAW_NWP.iterdir()) if p.is_file()]
-    _write_json(NWP_OUT / "current.json", {"run_id": run_id, "sig": sig})
+    _write_json(NWP_OUT / "current.json", {"run_id": run_id, "sig": sig,
+                                            "fields_found": status["nwp"]["fields_found"],
+                                            "fields_missing": status["nwp"]["fields_missing"]})
     for d in NWP_OUT.iterdir():
         if d.is_dir() and d.name < run_id:
             shutil.rmtree(d, ignore_errors=True)
