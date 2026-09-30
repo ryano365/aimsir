@@ -82,7 +82,7 @@ All settings are environment variables. `.env.example` lists them with comments.
 | `RADAR_MIN_DBZ` | `7` | Hide echoes weaker than this (≈0.1 mm/h). Raise it if you see clutter |
 | `RADAR_HISTORY_MINUTES` | `120` | Length of the radar loop |
 | `NWP_MAX_HOURS` | `60` | How far ahead to render |
-| `NWP_FILE_REGEX`, `NWP_MAX_FILE_MB`, `NWP_MAX_RAW_GB` | `.*`, 1500, 20 | See above |
+| `NWP_FILE_REGEX`, `NWP_MAX_FILE_MB`, `NWP_MAX_RAW_GB` | `.*`, 1500, 8 | See above |
 
 ## How it works
 
@@ -101,7 +101,7 @@ Met portal ──list/download──▶ data/raw/{radar,nwp} ──decode──�
 
 Areas outside radar range are lightly hatched so "no rain" and "no data" look different.
 
-**NWP** (`app/nwp.py`): every GRIB message is scanned, and the ones it needs are recognised by their keys. That covers 2 m temperature, 10 m u/v, MSLP, precipitation and cloud, in GRIB1 (including the HIRLAM/ALADIN local table 253) or GRIB2. Then the app:
+**NWP** (`app/nwp.py`): Met's current model is DINI-EPS (HARMONIE-AROME 43h2.2.1, 2 km Lambert grid, GRIB2 with CCSDS packing, a new run every hour out to T+60, 1 control + 30 ensemble members). Only the control member is drawn. Because runs arrive hourly and may still be filling in, the app shows the newest run that is at least 90% as long as the most complete one it has. Every GRIB message is scanned, and the ones it needs are recognised by their keys. That covers 2 m temperature, 10 m u/v, MSLP, precipitation and cloud, in GRIB1 (including the HIRLAM/ALADIN local table 253) or GRIB2. Then the app:
 - reprojects the fields from the model's Lambert grid with a nearest-neighbour KD-tree, which works for any grid ecCodes can describe;
 - rotates grid-relative winds to true north;
 - turns accumulated precipitation into hourly rates;

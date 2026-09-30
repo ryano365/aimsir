@@ -59,7 +59,7 @@ class Settings:
     nwp_poll_s: int = field(default_factory=lambda: _int("NWP_POLL_SECONDS", 900))
     nwp_file_regex: str = field(default_factory=lambda: _env("NWP_FILE_REGEX", r".*"))
     nwp_max_file_mb: int = field(default_factory=lambda: _int("NWP_MAX_FILE_MB", 1500))
-    nwp_max_raw_gb: float = field(default_factory=lambda: _float("NWP_MAX_RAW_GB", 20))
+    nwp_max_raw_gb: float = field(default_factory=lambda: _float("NWP_MAX_RAW_GB", 8))
     nwp_max_hours: int = field(default_factory=lambda: _int("NWP_MAX_HOURS", 60))
 
     forecast_cache_s: int = field(default_factory=lambda: _int("FORECAST_CACHE_SECONDS", 1800))

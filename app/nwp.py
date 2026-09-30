@@ -58,6 +58,13 @@ def classify(h) -> str | None:
                 return "tp"
             if iop == 71 and lt not in ("isobaricInhPa", "hybrid"):
                 return "tcc"
+    if ed == 2 and _get(h, "discipline", -1) == 0:
+        # Fall back on the raw WMO codes in case a local table renames things
+        cat, num = _get(h, "parameterCategory", -1), _get(h, "parameterNumber", -1)
+        if (cat, num) in ((1, 8), (1, 52)) and lt in ("surface", "heightAboveGround", ""):
+            return "tp"
+        if (cat, num) == (6, 1) and lt not in ("isobaricInhPa", "hybrid"):
+            return "tcc"
     if sn in ("2t", "t2m") or (sn == "t" and lt == "heightAboveGround" and lev == 2):
         return "t2"
     if sn in ("10u",) or (sn == "u" and lt == "heightAboveGround" and lev == 10):
@@ -98,7 +105,9 @@ def scan(paths: list[Path]) -> list[MsgRef]:
                     if h is None:
                         break
                     try:
-                        fld = classify(h)
+                        # DINI-EPS ships 1 control + 30 perturbed members; only the control is drawn.
+                        member = _get(h, "perturbationNumber", _get(h, "number", 0)) or 0
+                        fld = classify(h) if member == 0 else None
                         if fld:
                             refs.append(MsgRef(
                                 path=p, offset=int(_get(h, "offset", 0)), field=fld,
@@ -243,11 +252,25 @@ LAYERS = {
 INSPECT_STEP = 3  # decimation for the click-to-inspect value store
 
 
+def pick_run(refs: list[MsgRef], max_hours: int) -> datetime:
+    """DINI runs every hour and its files may still be arriving. Use the newest run
+    that is (nearly) as long as the most complete one we have, so the map doesn't
+    flip to a run with only a handful of hours in it."""
+    hours: dict[datetime, set] = defaultdict(set)
+    for r in refs:
+        if r.field in ("t2", "tp") and r.valid <= r.run + timedelta(hours=max_hours):
+            hours[r.run].add(r.valid)
+    if not hours:
+        return max(r.run for r in refs)
+    best = max(len(v) for v in hours.values())
+    return max(run for run, v in hours.items() if len(v) >= 0.9 * best)
+
+
 def process_run(refs: list[MsgRef], out_dir: Path, max_hours: int, grid: MercGrid = NWP_GRID) -> dict:
     """Render every hour of the newest run found in refs. Returns the index."""
     if not refs:
         raise ValueError("no recognised NWP fields in the downloaded files")
-    run = max(r.run for r in refs)
+    run = pick_run(refs, max_hours)
     refs = [r for r in refs if r.run == run and r.valid <= run + timedelta(hours=max_hours)]
     by_time: dict[datetime, dict[str, MsgRef]] = defaultdict(dict)
     for r in refs:

@@ -197,6 +197,8 @@ async def nwp_loop(client: MetClient | None):
             _sweep_inbox()
             if client:
                 listing = await client.list("nwp", _now() - timedelta(hours=3))
+                # newest first, so the latest run is complete before any size limit kicks in
+                listing.sort(key=lambda it: str(it.get("timestamp") or it.get("name")), reverse=True)
                 have = {p.name for p in RAW_NWP.iterdir()}
                 skipped = 0
                 for item in listing:
