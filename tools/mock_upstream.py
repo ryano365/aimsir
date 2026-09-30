@@ -94,3 +94,21 @@ def nrt_download(dataset: str, files: str, api_key: str = Header(None, alias="ap
                 z.write(_PORTAL / dataset / n, n)
         return Response(buf.getvalue(), media_type="application/octet-stream")
     return Response((_PORTAL / dataset / names[0]).read_bytes(), media_type="application/octet-stream")
+
+
+@app.get("/obs_present.xml")
+def obs():
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    rows = [("Dublin", 13, "scattered_clouds-night.png", "FAIR", "07", "SW", 78, "0.0", 1008),
+            ("Phoenix Park", 12, "overcast.png", "OVERCAST", "05", "S", 82, "0.0", 1008),
+            ("Casement", 12, "light_rain.png", "LIGHT RAIN", "09", "SSW", 88, "0.4", 1007),
+            ("Shannon", 14, "rain.png", "RAIN", "14", "SW", 93, "1.8", 1004),
+            ("Cork", 15, "few_clouds-night.png", "FAIR", "10", "WSW", 80, "0.0", 1005),
+            ("Malin Head", 11, "showers.png", "RAIN SHOWER", "22", "W", 85, "2.2", 1003)]
+    body = "".join(
+        f'<station name="{n}"><temp unit="C">{t}</temp><symbol>{sym}</symbol><weather_text>{wt}</weather_text>'
+        f'<wind_speed unit="kts">{ws} </wind_speed><wind_direction> {wd} </wind_direction>'
+        f'<humidity unit="%"> {h} </humidity><rainfall unit="mm/h"> {r} </rainfall><pressure unit="hPa">{p}</pressure></station>'
+        for n, t, sym, wt, ws, wd, h, r, p in rows)
+    return Response(f'<?xml version="1.0"?><observations time="{now.isoformat()}">{body}</observations>',
+                    media_type="application/xml")

@@ -35,20 +35,41 @@
     set(k, v) { try { localStorage.setItem("aimsir." + k, JSON.stringify(v)); } catch { /* private mode */ } },
   };
 
+  // ------------------------------------------------------------ settings (saved in this browser)
+  const DEFAULTS = {
+    theme: "system", home: null, startView: "ireland", startLayer: "last",
+    nowMode: "live", speed: "normal", tempUnit: "C", windUnit: "kmh",
+  };
+  let settings = { ...DEFAULTS, ...store.get("settings", {}) };
+  const saveSettings = () => store.set("settings", settings);
+  const sysDark = matchMedia("(prefers-color-scheme: dark)");
+  const isDark = () => settings.theme === "dark" || (settings.theme === "system" && sysDark.matches);
+
+  const WIND_UNITS = { kmh: [1, "km/h"], mph: [0.621371, "mph"], kt: [0.539957, "kt"], ms: [1 / 3.6, "m/s"] };
+  const toT = (c) => (settings.tempUnit === "F" ? c * 9 / 5 + 32 : c);
+  const tStr = (c) => (c == null ? "–" : String(Math.round(toT(c))));
+  const tUnit = () => (settings.tempUnit === "F" ? "°F" : "°C");
+  const toW = (kmh) => kmh * WIND_UNITS[settings.windUnit][0];
+  const wStr = (kmh) => (kmh == null ? "–" : String(Math.round(toW(kmh))));
+  const wUnit = () => WIND_UNITS[settings.windUnit][1];
+  const SPEED = { slow: 1.8, normal: 1, fast: 0.55 };
+
   // ------------------------------------------------------------ map (MapLibre GL)
   // One GPU-drawn map for everything: basemap, weather tiles, isobars and labels
   // all move together, so zooming is smooth and nothing snaps into place afterwards.
-  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
   const OFM = "https://tiles.openfreemap.org";
   const GLYPHS = `${OFM}/fonts/{fontstack}/{range}.pbf`;
   const FONT = ["Noto Sans Regular"];
-  const INK = dark ? "#e6e3da" : "#1c1f22";
-  const HALO = dark ? "rgba(23,25,27,0.9)" : "rgba(250,249,245,0.92)";
+  const ink = () => (isDark() ? "#e6e3da" : "#1c1f22");
+  const halo = () => (isDark() ? "rgba(23,25,27,0.9)" : "rgba(250,249,245,0.92)");
   let map = null;
   let firstSymbol;          // weather goes below the basemap's labels
   let coastAlways = false;
 
   async function buildStyle(kind) {
+    const dark = isDark();
+    const HALO = halo();
+    coastAlways = false;
     const plain = {
       version: 8, glyphs: GLYPHS, sources: {},
       layers: [{ id: "bg", type: "background", paint: { "background-color": dark ? "#1b1e21" : "#e4e6e3" } }],
@@ -90,10 +111,11 @@
     return plain;
   }
 
-  async function initMap(kind) {
+  async function initMap(kind, view) {
     const style = await buildStyle(kind);
     map = new maplibregl.Map({
-      container: "map", style, center: [-7.9, 53.45], zoom: 6.3, minZoom: 4.5, maxZoom: 12.5,
+      container: "map", style, center: view?.center || [-7.9, 53.45], zoom: view?.zoom || 6.3,
+      minZoom: 4.5, maxZoom: 12.5,
       attributionControl: false, dragRotate: false, pitchWithRotate: false, touchPitch: false,
       fadeDuration: 0,
     });
@@ -105,14 +127,20 @@
     }), "bottom-right");
     window.aimsirMap = map; // handy from the dev console
     await new Promise((ok) => (map.loaded() ? ok() : map.once("load", ok)));
+    addOverlays();
+    if (matchMedia("(max-width: 760px)").matches) {
+      document.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show");
+    }
+    map.on("click", onMapClick);
+  }
 
+  // Our own layers on top of whichever basemap style is loaded (re-run after a theme change).
+  function addOverlays() {
+    const INK = ink(), HALO = halo();
     // Some basemap label layers (water names) sit below the road lines in the style.
     // Lift every label to the top so the weather can go between shapes and labels.
     for (const l of map.getStyle().layers) if (l.type === "symbol") map.moveLayer(l.id);
     firstSymbol = map.getStyle().layers.find((l) => l.type === "symbol")?.id;
-    if (matchMedia("(max-width: 760px)").matches) {
-      document.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show");
-    }
     // Invisible marker layer: weather frames are inserted below it, overlays above it.
     map.addLayer({ id: "anchor-wx", type: "background", paint: { "background-opacity": 0 } }, firstSymbol);
 
@@ -127,11 +155,28 @@
     map.addLayer({ id: "isobar-labels", type: "symbol", source: "isobars",
                    layout: { "symbol-placement": "line", "symbol-spacing": 320, "text-field": ["to-string", ["get", "hpa"]],
                              "text-font": FONT, "text-size": 10, "text-keep-upright": true },
-                   paint: { "text-color": dark ? "#b9b6ad" : "#4a4d50", "text-halo-color": HALO, "text-halo-width": 1.5 } });
-
-    map.on("click", onMapClick);
+                   paint: { "text-color": isDark() ? "#b9b6ad" : "#4a4d50", "text-halo-color": HALO, "text-halo-width": 1.5 } });
     syncCoast();
   }
+
+  async function applyTheme() {
+    document.documentElement.dataset.theme = isDark() ? "dark" : "light";
+    if (!map) return;
+    const style = await buildStyle(S.cfg?.basemap || "openfreemap");
+    map.setStyle(style, { diff: false });
+    map.once("style.load", () => {
+      addOverlays();
+      S.wxIds.clear();
+      S.currentId = null;
+      S.wantId = null;
+      S.coverageUrl = null;
+      ensureCoverage();
+      S.isoStamp = null;
+      if (S.frames.length) show(S.i);
+      else updateIsobars(new Date());
+    });
+  }
+  sysDark.addEventListener("change", () => settings.theme === "system" && applyTheme());
 
   function syncCoast() {
     if (!map?.getLayer("coast")) return;
@@ -161,7 +206,7 @@
     frames: [], i: 0, playing: false, timer: null, followLatest: true,
     currentId: null, wantId: null, wxIds: new Set(), coverageUrl: null,
     isobars: store.get("isobars", true), isoCache: new Map(), isoStamp: null,
-    place: store.get("place", null), homePin: null, status: null,
+    place: null, homePin: null, status: null, fcHours: undefined, live: undefined,
   };
 
   const RADAR_MODES = ["radar", "radaracc"];
@@ -329,7 +374,7 @@
       }
       waitingSince = 0;
       show(next);
-      const hold = S.i === S.frames.length - 1 ? 1400 : isRadar(S.mode) ? 260 : 420;
+      const hold = (S.i === S.frames.length - 1 ? 1400 : isRadar(S.mode) ? 260 : 420) * SPEED[settings.speed];
       S.timer = setTimeout(step, hold);
     };
     if (S.i >= S.frames.length - 1) show(0);
@@ -384,9 +429,12 @@
     if (!lg || !S.frames.length) { el.innerHTML = ""; return; }
     const steps = lg.steps;
     el.classList.toggle("dense", steps.length > 12);
-    const lbl = (v) => (Math.abs(v) < 1 && v !== 0 ? String(v).replace(/^0/, "") : String(v));
+    const conv = lg.key === "temp" ? (v) => Math.round(toT(v))
+      : ["wind", "gust"].includes(lg.key) ? (v) => Math.round(toW(v)) : (v) => v;
+    const unit = lg.key === "temp" ? tUnit() : ["wind", "gust"].includes(lg.key) ? wUnit() : lg.unit;
+    const lbl = (v0) => { const v = conv(v0); return Math.abs(v) < 1 && v !== 0 ? String(v).replace(/^0/, "") : String(v); };
     el.innerHTML =
-      `<div class="ttl">${esc(lg.label)} · ${esc(lg.unit)}</div>` +
+      `<div class="ttl">${esc(lg.label)} · ${esc(unit)}</div>` +
       `<div class="ramp">${steps.map((s) => `<span style="background:${s.colour}"></span>`).join("")}</div>` +
       `<div class="lbls">${steps.map((s, k) => `<span>${(k === 0 && lg.key === "temp") || (steps.length > 12 && k % 2) ? "" : lbl(s.from)}</span>`).join("")}${lg.above != null ? `<span>${lbl(lg.above)}+</span>` : ""}</div>`;
   }
@@ -459,12 +507,12 @@
     try {
       const v = await getJSON(`/api/nwp/inspect?stamp=${best.stamp}&lat=${lat}&lon=${lng}`);
       const rows = [
-        ["Temp", v.temp != null && `${v.temp.toFixed(1)} °C`],
+        ["Temp", v.temp != null && `${toT(v.temp).toFixed(1)} ${tUnit()}`],
         ["Rain", v.rain != null && `${v.rain.toFixed(1)} mm/h`],
-        ["Wind", v.wind != null && `${compass(v.wind_dir)} ${Math.round(v.wind)} km/h`],
+        ["Wind", v.wind != null && `${compass(v.wind_dir)} ${wStr(v.wind)} ${wUnit()}`],
         ["Cloud", v.cloud != null && `${Math.round(v.cloud)} %`],
         ["MSLP", v.msl != null && `${Math.round(v.msl)} hPa`],
-        ["Gusts", v.gust != null && `${Math.round(v.gust)} km/h`],
+        ["Gusts", v.gust != null && `${wStr(v.gust)} ${wUnit()}`],
         ["Visibility", v.vis != null && (v.vis >= 10 ? "10 km+" : `${v.vis < 1 ? Math.round(v.vis * 1000) + " m" : v.vis.toFixed(1) + " km"}`)],
         ["Snow", v.snow != null && v.snow >= 0.5 && `${v.snow.toFixed(0)} mm w.e.`],
         ["Lightning", v.lightning != null && v.lightning >= 0.5 && v.lightning.toFixed(v.lightning < 10 ? 1 : 0)],
@@ -494,42 +542,124 @@
 
   function setPlace(p) {
     S.place = p;
-    store.set("place", p);
     buildPlaces();
     if (S.homePin) S.homePin.remove();
     const pin = Object.assign(document.createElement("div"), { className: "home-pin" });
     S.homePin = new maplibregl.Marker({ element: pin }).setLngLat([p.lon, p.lat]).addTo(map);
     loadForecast();
+    loadLive();
   }
 
   async function loadForecast() {
     const p = S.place;
-    let fc;
-    try { fc = await getJSON(`/api/forecast?lat=${p.lat}&lon=${p.lon}`); } catch (e) {
-      $("#now-desc").textContent = "Forecast unavailable right now.";
-      return;
+    try {
+      const fc = await getJSON(`/api/forecast?lat=${p.lat}&lon=${p.lon}`);
+      if (S.place !== p) return;
+      S.fcHours = fc.hours.map((h) => ({ ...h, t: new Date(h.time) }));
+    } catch {
+      S.fcHours = null;
     }
-    const hours = fc.hours.map((h) => ({ ...h, t: new Date(h.time) }));
-    const now = Date.now();
-    const cur = hours.find((h) => h.t.getTime() >= now - 30 * 60e3) || hours[0];
+    renderForecastPanels();
+  }
+
+  async function loadLive() {
+    const p = S.place;
+    try {
+      const live = await getJSON(`/api/live?lat=${p.lat}&lon=${p.lon}`);
+      if (S.place !== p) return;
+      S.live = live;
+    } catch {
+      S.live = null;
+    }
+    renderNow();
+  }
+
+  function renderForecastPanels() {
+    renderNow();
+    const hours = S.fcHours;
+    if (!hours) { $("#meteogram").innerHTML = ""; $("#days").innerHTML = ""; return; }
+    const cur = currentHour();
     if (!cur) return;
-    const sym = cur.symbol || hours.find((h) => h.symbol && h.t >= cur.t)?.symbol;
-    $("#now-temp").innerHTML = `${cur.temp != null ? Math.round(cur.temp) : "–"}<sup>°C</sup>`;
-    $("#now-glyph").innerHTML = Glyphs.glyph(sym);
-    $("#now-desc").textContent = Glyphs.describe(sym) + (cur.dew != null ? ` · dew point ${Math.round(cur.dew)}°` : "");
-    const next3 = hours.filter((h) => h.t > cur.t - 1 && h.t <= cur.t.getTime() + 3 * 3.6e6).reduce((a, h) => a + (h.precip || 0), 0);
-    const cells = [
-      ["Wind", `${compass(cur.wind_dir)} ${cur.wind_kmh ?? "–"}`, "km/h"],
-      ["Gusts", `${cur.gust_kmh ?? "–"}`, "km/h"],
-      ["Rain 3 h", next3.toFixed(1), "mm"],
-      ["Humidity", `${cur.humidity != null ? Math.round(cur.humidity) : "–"}`, "%"],
-      ["Pressure", `${cur.pressure != null ? Math.round(cur.pressure) : "–"}`, "hPa"],
-      ["Cloud", `${cur.cloud != null ? Math.round(cur.cloud) : "–"}`, "%"],
-    ];
-    $("#now-grid").innerHTML = cells.map(([k, v, u]) => `<div><dt>${k}</dt><dd>${v} <small>${u}</small></dd></div>`).join("");
     drawMeteogram(hours.filter((h) => h.t >= cur.t && h.t <= cur.t.getTime() + 48 * 3.6e6));
     drawDays(hours);
   }
+
+  const currentHour = () => {
+    const hours = S.fcHours;
+    if (!hours?.length) return null;
+    const now = Date.now();
+    return hours.find((h) => h.t.getTime() >= now - 30 * 60e3) || hours[0];
+  };
+
+  function renderNow() {
+    const mode = settings.nowMode;
+    document.querySelectorAll("#now-mode button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.v === mode)));
+    const sec = $("#now");
+    sec.classList.toggle("live", mode === "live");
+    sec.classList.toggle("fc", mode !== "live");
+    const cell = (k, v, u) => `<div><dt>${k}</dt><dd>${v}${u ? ` <small>${u}</small>` : ""}</dd></div>`;
+
+    if (mode === "live") {
+      const st = S.live?.station;
+      const rd0 = S.live?.radar;
+      const rd = rd0 && Date.now() - new Date(rd0.time) < 30 * 60e3 ? rd0 : null;   // ignore stale radar
+      if (!st) {
+        $("#now-kicker").textContent = S.live ? "No station observations available right now" : "Loading observations…";
+        $("#now-temp").innerHTML = "–";
+        $("#now-glyph").innerHTML = "";
+        $("#now-desc").textContent = "";
+        $("#now-grid").innerHTML = "";
+        return;
+      }
+      const obsT = st.time ? new Date(st.time) : null;
+      $("#now-kicker").textContent = `Observed · ${st.label}${st.distance_km > 1 ? ` · ${st.distance_km} km away` : ""}${obsT ? ` · ${hm(obsT)}` : ""}`;
+      $("#now-temp").innerHTML = `${tStr(st.temp)}<sup>${tUnit()}</sup>`;
+      $("#now-glyph").innerHTML = Glyphs.glyph(st.symbol);
+      let radarTxt = "";
+      if (rd?.covered) radarTxt = rd.rate_mmh > 0 ? `radar shows ${rd.rate_mmh.toFixed(1)} mm/h here` : "radar shows no rain here";
+      $("#now-desc").textContent = [st.weather, radarTxt].filter(Boolean).join(" · ");
+      $("#now-grid").innerHTML = [
+        cell("Wind", `${st.wind_name || ""} ${wStr(st.wind_kmh)}`, wUnit()),
+        cell("Humidity", st.humidity != null ? Math.round(st.humidity) : "–", "%"),
+        cell("Pressure", st.pressure != null ? Math.round(st.pressure) : "–", "hPa"),
+        cell("Rain, station", st.rain_mmh != null ? st.rain_mmh.toFixed(1) : "–", "mm/h"),
+        cell("Radar here", rd?.covered ? (rd.rate_mmh > 0 ? rd.rate_mmh.toFixed(1) : "dry") : "–", rd?.covered && rd.rate_mmh > 0 ? "mm/h" : ""),
+        cell("Radar time", rd?.time ? hm(new Date(rd.time)) : "–", ""),
+      ].join("");
+      return;
+    }
+
+    const hours = S.fcHours;
+    const cur = currentHour();
+    if (!cur) {
+      $("#now-kicker").textContent = hours === null ? "Forecast unavailable right now" : "Loading forecast…";
+      $("#now-temp").innerHTML = "–";
+      $("#now-glyph").innerHTML = "";
+      $("#now-desc").textContent = "";
+      $("#now-grid").innerHTML = "";
+      return;
+    }
+    const sym = cur.symbol || hours.find((h) => h.symbol && h.t >= cur.t)?.symbol;
+    $("#now-kicker").textContent = `Model forecast · for ${hm(cur.t)}`;
+    $("#now-temp").innerHTML = `${tStr(cur.temp)}<sup>${tUnit()}</sup>`;
+    $("#now-glyph").innerHTML = Glyphs.glyph(sym);
+    $("#now-desc").textContent = Glyphs.describe(sym) + (cur.dew != null ? ` · dew point ${tStr(cur.dew)}°` : "");
+    const next3 = hours.filter((h) => h.t > cur.t - 1 && h.t <= cur.t.getTime() + 3 * 3.6e6).reduce((a, h) => a + (h.precip || 0), 0);
+    $("#now-grid").innerHTML = [
+      cell("Wind", `${compass(cur.wind_dir)} ${wStr(cur.wind_kmh)}`, wUnit()),
+      cell("Gusts", wStr(cur.gust_kmh), wUnit()),
+      cell("Rain 3 h", next3.toFixed(1), "mm"),
+      cell("Humidity", cur.humidity != null ? Math.round(cur.humidity) : "–", "%"),
+      cell("Pressure", cur.pressure != null ? Math.round(cur.pressure) : "–", "hPa"),
+      cell("Cloud", cur.cloud != null ? Math.round(cur.cloud) : "–", "%"),
+    ].join("");
+  }
+
+  document.querySelectorAll("#now-mode button").forEach((b) => b.addEventListener("click", () => {
+    settings.nowMode = b.dataset.v;
+    saveSettings();
+    renderNow();
+  }));
 
   function drawMeteogram(hs) {
     const el = $("#meteogram");
@@ -537,6 +667,7 @@
     const W = 300, top = 16, tH = 70, pTop = top + tH + 6, pH = 30, wY = pTop + pH + 30;
     const t0 = hs[0].t.getTime(), t1 = hs[hs.length - 1].t.getTime();
     const x = (t) => ((t - t0) / (t1 - t0)) * W;
+    hs = hs.map((h) => ({ ...h, temp: h.temp == null ? null : toT(h.temp) }));
     const temps = hs.map((h) => h.temp).filter((v) => v != null);
     const tmin = Math.floor(Math.min(...temps)) - 1, tmax = Math.ceil(Math.max(...temps)) + 1;
     const y = (v) => top + tH - ((v - tmin) / (tmax - tmin)) * tH;
@@ -580,7 +711,7 @@
       if (X < 6 || X > W - 6) continue;
       const rot = (h.wind_dir + 180) % 360; // arrow points where wind goes
       parts.push(`<g transform="translate(${X.toFixed(1)} ${wY}) rotate(${rot})"><path class="wind" d="M0 5V-5M-3 -2L0 -5L3 -2"/></g>`);
-      parts.push(`<text x="${X.toFixed(1)}" y="${wY + 16}" text-anchor="middle">${h.wind_kmh ?? ""}</text>`);
+      parts.push(`<text x="${X.toFixed(1)}" y="${wY + 16}" text-anchor="middle">${h.wind_kmh == null ? "" : wStr(h.wind_kmh)}</text>`);
     }
     el.innerHTML = `<svg viewBox="0 -2 ${W} ${wY + 20}" role="img" aria-label="Temperature, rain and wind for the next 48 hours">${parts.join("")}</svg>`;
   }
@@ -606,9 +737,9 @@
       return `<li>
         <span class="d">${k === 0 ? "Today" : fDay.format(d[0].t)}</span>
         ${Glyphs.glyph(sym)}
-        <span class="range"><span class="lo">${Math.round(mn)}°</span><span class="bar"><i style="left:${pct(mn)}%;right:${100 - pct(mx)}%"></i></span><span>${Math.round(mx)}°</span></span>
+        <span class="range"><span class="lo">${tStr(mn)}°</span><span class="bar"><i style="left:${pct(mn)}%;right:${100 - pct(mx)}%"></i></span><span>${tStr(mx)}°</span></span>
         <span class="mm ${mm < 0.2 ? "dry" : ""}">${mm < 0.2 ? "dry" : mm.toFixed(1) + " mm"}</span>
-        <span class="w">${compass(windy.wind_dir)} ${windy.wind_kmh ?? ""}</span>
+        <span class="w">${compass(windy.wind_dir)} ${windy.wind_kmh == null ? "" : wStr(windy.wind_kmh)}</span>
       </li>`;
     }).join("");
   }
@@ -696,13 +827,91 @@
     if (!S.frames.length) emptyState();
   }
 
+  // ------------------------------------------------------------ settings dialog
+  function homePlace() {
+    if (settings.home) return settings.home;
+    const h = S.cfg?.home || { name: "Dublin", lat: 53.3498, lon: -6.2603 };
+    return { name: h.name, lat: h.lat, lon: h.lon, custom: !PLACES.some((p) => p[0] === h.name) };
+  }
+
+  const dlg = $("#settings");
+  function fillSettings() {
+    dlg.querySelectorAll(".seg[data-setting]").forEach((seg) => {
+      seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(settings[seg.dataset.setting] === b.dataset.v)));
+    });
+    dlg.querySelector("select[data-setting=startLayer]").value = settings.startLayer;
+    const sel = $("#set-home");
+    const opts = [`<option value="">Server default (${esc(S.cfg?.home?.name || "Dublin")})</option>`]
+      .concat(PLACES.map((p, k) => `<option value="${k}">${p[0]}</option>`));
+    if (settings.home?.custom) opts.push(`<option value="c">${esc(settings.home.name)}</option>`);
+    sel.innerHTML = opts.join("");
+    sel.value = !settings.home ? "" : settings.home.custom ? "c" : String(PLACES.findIndex((p) => p[0] === settings.home.name));
+  }
+  function applySetting(key) {
+    saveSettings();
+    if (key === "theme") applyTheme();
+    if (key === "tempUnit" || key === "windUnit") { renderForecastPanels(); drawLegend(); }
+    if (key === "nowMode") renderNow();
+    if (key === "home") setPlace(homePlace());
+    fillSettings();
+  }
+  $("#open-settings").addEventListener("click", () => { fillSettings(); $("#set-home-note").textContent = ""; dlg.showModal(); });
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });   // click on the backdrop
+  dlg.querySelectorAll(".seg[data-setting] button").forEach((b) => b.addEventListener("click", () => {
+    const key = b.closest(".seg").dataset.setting;
+    settings[key] = b.dataset.v;
+    applySetting(key);
+  }));
+  dlg.querySelector("select[data-setting=startLayer]").addEventListener("change", (e) => {
+    settings.startLayer = e.target.value;
+    applySetting("startLayer");
+  });
+  $("#set-home").addEventListener("change", (e) => {
+    const v = e.target.value;
+    if (v === "") settings.home = null;
+    else if (v !== "c") { const p = PLACES[+v]; settings.home = { name: p[0], lat: p[1], lon: p[2] }; }
+    applySetting("home");
+  });
+  $("#set-home-centre").addEventListener("click", () => {
+    const c = map.getCenter();
+    settings.home = { name: `${c.lat.toFixed(2)}, ${c.lng.toFixed(2)}`, lat: +c.lat.toFixed(4), lon: +c.lng.toFixed(4), custom: true };
+    applySetting("home");
+    $("#set-home-note").textContent = "Default set to the centre of the map.";
+  });
+  $("#set-home-gps").addEventListener("click", () => {
+    const note = $("#set-home-note");
+    if (!navigator.geolocation || !window.isSecureContext) {
+      note.textContent = "Your browser only shares location over HTTPS. Open Aimsir through your HTTPS proxy, or use the map centre instead.";
+      return;
+    }
+    note.textContent = "Finding you…";
+    navigator.geolocation.getCurrentPosition((pos) => {
+      const { latitude: lat, longitude: lon } = pos.coords;
+      settings.home = { name: "My location", lat: +lat.toFixed(4), lon: +lon.toFixed(4), custom: true };
+      applySetting("home");
+      note.textContent = `Default set to ${lat.toFixed(3)}, ${lon.toFixed(3)}.`;
+    }, (err) => { note.textContent = `Couldn't get your location (${err.message}).`; }, { timeout: 10000 });
+  });
+  $("#settings-reset").addEventListener("click", () => {
+    const themeChanged = settings.theme !== DEFAULTS.theme;
+    settings = { ...DEFAULTS };
+    saveSettings();
+    if (themeChanged) applyTheme();
+    renderForecastPanels();
+    drawLegend();
+    setPlace(homePlace());
+    fillSettings();
+  });
+
   // ------------------------------------------------------------ boot
   (async function boot() {
     S.cfg = await getJSON("/api/config").catch(() => ({ home: { name: "Dublin", lat: 53.35, lon: -6.26 }, has_key: false, basemap: "openfreemap" }));
-    await initMap(S.cfg.basemap || "openfreemap");
+    const home = homePlace();
+    const view = settings.startView === "home" ? { center: [home.lon, home.lat], zoom: 8.2 } : null;
+    await initMap(S.cfg.basemap || "openfreemap", view);
     map.on("sourcedata", onSourceData);
-    if (!S.place) S.place = { name: S.cfg.home.name, lat: S.cfg.home.lat, lon: S.cfg.home.lon, custom: !PLACES.some((p) => p[0] === S.cfg.home.name) };
-    setPlace(S.place);
+    if (settings.startLayer !== "last") S.mode = settings.startLayer;
+    setPlace(home);
     await Promise.all([refreshStatus(), refreshRadar(), refreshNwp()]);
     const avail = (m) => m === "radar" || (m === "radaracc" ? !!S.radar?.acc?.frames?.length
       : (S.nwp?.frames || []).some((f) => f.layers.includes(m)));
@@ -715,5 +924,6 @@
     setInterval(refreshStatus, 60e3);
     setInterval(loadWarnings, 10 * 60e3);
     setInterval(loadForecast, 30 * 60e3);
+    setInterval(loadLive, 5 * 60e3);
   })();
 })();

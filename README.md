@@ -5,6 +5,8 @@ A small self-hosted weather viewer for Ireland built on Met Éireann open data:
 - **Radar**: the last 2 hours of Dublin + Shannon radar, composited and looped over a map.
 - **Model**: HARMONIE-AROME NWP fields (rain, temperature, wind with arrows, cloud) and MSLP isobars, hour by hour for the latest run. Click the map to see the model's values for that spot.
 - **More layers** (tucked under a collapsible menu): radar rainfall totals for each past hour (Met's hourly Dublin+Shannon composite), plus model wind gusts, lightning, visibility/fog and lying snow.
+- **Live vs forecast card**: a toggle on the location card switches between what's being measured now (the nearest Met Éireann station's latest observation, plus the app's own radar sampled at that exact spot) and what the model says for this hour.
+- **Settings** (button at the bottom of the sidebar, saved per browser): light/dark/system theme, default location (preset, map centre or device location), where the map opens, start-up layer, animation speed, and °C/°F plus km/h, mph, knots or m/s.
 - **Point forecast**: current conditions, a 48-hour meteogram and a daily outlook for any location (Met's WDB point-forecast API).
 - **Warnings**: current Met Éireann warnings shown at the top of the sidebar.
 
@@ -82,6 +84,7 @@ All settings are environment variables. `.env.example` lists them with comments.
 | `BASEMAP` | `openfreemap` | `openfreemap` (free vector tiles, no key), `osm` (openstreetmap.org raster) or `none` (bundled coastline only, no external requests) |
 | `RADAR_FILE_REGEX` | `T_PAGZ4[01]_.*\.h5$` | 40 = Shannon, 41 = Dublin instantaneous volumes |
 | `RADAR_ACC_REGEX`, `RADAR_ACC_HOURS` | `T_PASH21_.*\.hdf$`, `12` | Hourly radar totals: which file (21 = composite, 41 = Dublin only) and how many hours to keep |
+| `MET_OBS_URL` | Met's `obs_present.xml` | Station observations for the Live card |
 | `RADAR_MIN_DBZ` | `7` | Hide echoes weaker than this (≈0.1 mm/h). Raise it if you see clutter |
 | `RADAR_HISTORY_MINUTES` | `120` | Length of the radar loop |
 | `NWP_MAX_HOURS` | `48` | How far ahead to render |

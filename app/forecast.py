@@ -106,3 +106,92 @@ async def warnings(client: httpx.AsyncClient) -> list[dict]:
                       ("level", "headline", "description", "onset", "expiry", "regions", "type", "severity")})
     _warn_cache = (time.time(), items)
     return items
+
+
+# ---------------------------------------------------------------- live observations
+
+# Met Éireann synoptic stations reported in obs_present.xml (approximate positions).
+STATIONS = {
+    "Athenry": (53.289, -8.786), "Ballyhaise": (54.051, -7.310), "Belmullet": (54.228, -10.007),
+    "Casement": (53.306, -6.439), "Claremorris": (53.711, -8.993), "Cork": (51.847, -8.486),
+    "Dublin": (53.428, -6.241), "Dunsany": (53.516, -6.660), "Finner": (54.494, -8.243),
+    "Gurteen": (53.052, -8.009), "Johnstown Castle": (52.298, -6.497), "Knock": (53.906, -8.817),
+    "Mace Head": (53.326, -9.901), "Malin Head": (55.372, -7.339), "Markree Castle": (54.175, -8.456),
+    "Moore Park": (52.164, -8.264), "Mt Dillon": (53.727, -7.981), "Mullingar": (53.537, -7.362),
+    "NewportMayo": (53.883, -9.546), "Oak Park": (52.861, -6.915), "Phoenix Park": (53.364, -6.350),
+    "Roche's Point": (51.793, -8.244), "Shannon": (52.690, -8.918), "Sherkin Island": (51.476, -9.428),
+    "Valentia": (51.938, -10.241), "Carlow": (52.861, -6.915), "Belfast": (54.664, -6.216),
+}
+LABELS = {"Dublin": "Dublin Airport", "Cork": "Cork Airport", "Shannon": "Shannon Airport",
+          "Knock": "Ireland West Airport", "Casement": "Casement Aerodrome", "NewportMayo": "Newport, Mayo"}
+_obs_cache: tuple[float, dict] | None = None
+KTS_TO_KMH = 1.852
+COMPASS = {"N": 0, "NNE": 22.5, "NE": 45, "ENE": 67.5, "E": 90, "ESE": 112.5, "SE": 135, "SSE": 157.5,
+           "S": 180, "SSW": 202.5, "SW": 225, "WSW": 247.5, "W": 270, "WNW": 292.5, "NW": 315, "NNW": 337.5}
+
+
+def _num(el):
+    try:
+        return float(el.text.strip())
+    except (AttributeError, ValueError):
+        return None
+
+
+def _obs_symbol(symbol: str, text: str) -> str:
+    """Map Met's observation icon / text to the glyph ids the frontend already draws."""
+    s = f"{symbol} {text}".lower()
+    night = "night" in s
+    if "thunder" in s:
+        base = "RainThunder"
+    elif "snow" in s:
+        base = "Snow"
+    elif "sleet" in s:
+        base = "Sleet"
+    elif "drizzle" in s:
+        base = "Drizzle"
+    elif "shower" in s:
+        base = "LightRainSun"
+    elif "rain" in s:
+        base = "Rain"
+    elif "fog" in s or "mist" in s or "haze" in s:
+        base = "Fog"
+    elif "overcast" in s or "broken" in s or "cloudy" in s:
+        base = "Cloud"
+    elif "scattered" in s or "few" in s or "partly" in s or "fair" in s:
+        base = "PartlyCloud"
+    elif "clear" in s or "sun" in s:
+        base = "Sun"
+    else:
+        base = "Cloud"
+    return ("Dark_" + base) if night and ("Sun" in base or base == "PartlyCloud") else base
+
+
+async def observations(client: httpx.AsyncClient) -> dict:
+    global _obs_cache
+    if _obs_cache and time.time() - _obs_cache[0] < 600:
+        return _obs_cache[1]
+    r = await client.get(settings.obs_url, timeout=15)
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    out = {"time": root.get("time"), "stations": []}
+    for st in root.iter("station"):
+        name = st.get("name", "").strip()
+        if name not in STATIONS:
+            continue
+        wd = (st.findtext("wind_direction") or "").strip().upper()
+        kts = _num(st.find("wind_speed"))
+        out["stations"].append({
+            "name": name, "label": LABELS.get(name, name),
+            "lat": STATIONS[name][0], "lon": STATIONS[name][1],
+            "temp": _num(st.find("temp")),
+            "weather": (st.findtext("weather_text") or "").strip().capitalize(),
+            "symbol": _obs_symbol(st.findtext("symbol") or "", st.findtext("weather_text") or ""),
+            "wind_kmh": None if kts is None else round(kts * KTS_TO_KMH),
+            "wind_dir": COMPASS.get(wd),
+            "wind_name": wd or None,
+            "humidity": _num(st.find("humidity")),
+            "rain_mmh": _num(st.find("rainfall")),
+            "pressure": _num(st.find("pressure")),
+        })
+    _obs_cache = (time.time(), out)
+    return out

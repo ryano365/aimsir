@@ -32,6 +32,8 @@ class Settings:
     # Point forecast API (HARMONIE/ECMWF blend, no key needed)
     pf_url: str = field(default_factory=lambda: _env(
         "MET_PF_URL", "http://openaccess.pf.api.met.ie/metno-wdb2ts/locationforecast"))
+    obs_url: str = field(default_factory=lambda: _env(
+        "MET_OBS_URL", "https://www.met.ie/Open_Data/xml/obs_present.xml"))
     warnings_url: str = field(default_factory=lambda: _env(
         "MET_WARNINGS_URL", "https://www.met.ie/Open_Data/json/warning_IRELAND.json"))
 

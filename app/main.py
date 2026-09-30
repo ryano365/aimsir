@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from . import nwp, radar, tiles
 from .grids import bilinear
 from .config import settings
-from .forecast import point_forecast, warnings
+from .forecast import observations, point_forecast, warnings
 from .met import MetClient, MetError
 from .palettes import RAIN, RAIN_ACC
 
@@ -526,6 +526,41 @@ async def forecast(lat: float = Query(ge=-90, le=90), lon: float = Query(ge=-180
         return await point_forecast(app.state.http, lat, lon)
     except httpx.HTTPError as e:
         raise HTTPException(502, f"forecast API: {e}") from e
+
+
+@app.get("/api/live")
+async def live(lat: float = Query(ge=-90, le=90), lon: float = Query(ge=-180, le=180)):
+    """What's being measured now near a point: the nearest Met Éireann station's latest
+    observation, plus the newest radar frame sampled exactly at the point."""
+    out: dict = {"station": None, "radar": None}
+    try:
+        obs = await observations(app.state.http)
+        best = None
+        for st in obs["stations"]:
+            d = float(radar.great_circle(lat, lon, st["lat"], st["lon"])[0]) / 1000
+            if st["temp"] is not None and (best is None or d < best[0]):
+                best = (d, st)
+        if best:
+            out["station"] = {**best[1], "distance_km": round(best[0]), "time": obs["time"]}
+    except (httpx.HTTPError, ValueError) as e:
+        out["station_error"] = str(e)
+    idx = _read_json(RADAR_OUT / "index.json", {})
+    frames = idx.get("frames", [])
+    if frames:
+        fr = frames[-1]
+        fdir = RADAR_FRAMES / fr["stamp"]
+        if (fdir / "meta.json").exists():
+            data = _radar_frame(fr["stamp"], (fdir / "meta.json").stat().st_mtime)
+            la, lo = np.array([[lat]]), np.array([[lon]])
+            dbz = np.nan
+            covered = False
+            for arr, m in data:
+                v = float(radar.sample_polar(arr, m, la, lo)[0, 0])
+                covered |= bool(radar.in_range(m, la, lo)[0, 0])
+                dbz = v if not np.isfinite(dbz) else max(dbz, v)
+            rate = float(radar.dbz_to_rate(np.array(dbz))) if np.isfinite(dbz) and dbz >= settings.radar_min_dbz else 0.0
+            out["radar"] = {"time": fr["time"], "covered": covered, "rate_mmh": round(rate, 1) if covered else None}
+    return out
 
 
 @app.get("/api/warnings")

@@ -9,6 +9,15 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.5' fill='none' stroke='%23c2410c' stroke-width='1.5'/%3E%3Ccircle cx='8' cy='8' r='1.6' fill='%23c2410c'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/vendor/maplibre/maplibre-gl.css">
 <link rel="stylesheet" href="/static/style.css">
+<script>
+  // apply the saved theme before first paint (no flash of the wrong colours)
+  (function () {
+    var t = "system";
+    try { t = (JSON.parse(localStorage.getItem("aimsir.settings") || "{}").theme) || "system"; } catch (e) {}
+    if (t === "system") t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
 </head>
 <body>
 <aside id="side">
@@ -19,10 +28,17 @@
 
   <div id="warnings"></div>
 
-  <section class="now">
-    <div class="place">
-      <select id="place" aria-label="Location"></select>
+  <section class="now" id="now">
+    <div class="now-head">
+      <div class="place">
+        <select id="place" aria-label="Location"></select>
+      </div>
+      <div class="seg" id="now-mode" role="tablist" aria-label="Current conditions source">
+        <button type="button" role="tab" data-v="live">Live</button>
+        <button type="button" role="tab" data-v="fc">Forecast</button>
+      </div>
     </div>
+    <div class="now-kicker" id="now-kicker">&nbsp;</div>
     <div class="now-main">
       <div class="now-temp" id="now-temp">–</div>
       <div class="now-glyph" id="now-glyph"></div>
@@ -42,6 +58,10 @@
   </section>
 
   <footer class="credits">
+    <button type="button" class="settings-btn" id="open-settings" aria-haspopup="dialog">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 5.2a2.8 2.8 0 1 0 0 5.6 2.8 2.8 0 0 0 0-5.6Z"/><path d="M6.9 1.5h2.2l.4 1.7 1.2.5 1.5-.9 1.6 1.6-.9 1.5.5 1.2 1.7.4v2.2l-1.7.4-.5 1.2.9 1.5-1.6 1.6-1.5-.9-1.2.5-.4 1.7H6.9l-.4-1.7-1.2-.5-1.5.9-1.6-1.6.9-1.5-.5-1.2-1.7-.4V6.9l1.7-.4.5-1.2-.9-1.5 1.6-1.6 1.5.9 1.2-.5Z"/></svg>
+      Settings
+    </button>
     <p>Radar and forecast data © Met Éireann, <a href="https://www.met.ie" target="_blank" rel="noopener">met.ie</a>.
     Published under <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
     Met Éireann does not accept any liability whatsoever for any error or omission in the data, their availability,
@@ -87,6 +107,80 @@
 
   <div class="empty" id="empty" hidden></div>
 </main>
+
+<dialog id="settings" class="settings" aria-labelledby="settings-title">
+  <form method="dialog">
+    <header>
+      <h2 id="settings-title">Settings</h2>
+      <button class="x" value="close" aria-label="Close">×</button>
+    </header>
+
+    <fieldset>
+      <legend>Appearance</legend>
+      <div class="row"><span>Theme</span>
+        <div class="seg" data-setting="theme">
+          <button type="button" data-v="system">System</button><button type="button" data-v="light">Light</button><button type="button" data-v="dark">Dark</button>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Default location</legend>
+      <p class="hint">Used for the forecast card and, if you like, where the map opens.</p>
+      <div class="row"><span>Location</span><select id="set-home"></select></div>
+      <div class="row buttons">
+        <button type="button" id="set-home-centre">Use map centre</button>
+        <button type="button" id="set-home-gps">Use my location</button>
+      </div>
+      <p class="hint" id="set-home-note"></p>
+      <div class="row"><span>When the map opens</span>
+        <div class="seg" data-setting="startView">
+          <button type="button" data-v="ireland">Show Ireland</button><button type="button" data-v="home">Zoom to location</button>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Map</legend>
+      <div class="row"><span>Start with</span>
+        <select data-setting="startLayer">
+          <option value="last">Last layer used</option><option value="radar">Radar</option><option value="rain">Rain (model)</option>
+          <option value="temp">Temperature</option><option value="wind">Wind</option><option value="cloud">Cloud</option>
+        </select>
+      </div>
+      <div class="row"><span>Card shows</span>
+        <div class="seg" data-setting="nowMode">
+          <button type="button" data-v="live">Live</button><button type="button" data-v="fc">Forecast</button>
+        </div>
+      </div>
+      <div class="row"><span>Animation speed</span>
+        <div class="seg" data-setting="speed">
+          <button type="button" data-v="slow">Slow</button><button type="button" data-v="normal">Normal</button><button type="button" data-v="fast">Fast</button>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Units</legend>
+      <div class="row"><span>Temperature</span>
+        <div class="seg" data-setting="tempUnit">
+          <button type="button" data-v="C">°C</button><button type="button" data-v="F">°F</button>
+        </div>
+      </div>
+      <div class="row"><span>Wind</span>
+        <div class="seg" data-setting="windUnit">
+          <button type="button" data-v="kmh">km/h</button><button type="button" data-v="mph">mph</button><button type="button" data-v="kt">knots</button><button type="button" data-v="ms">m/s</button>
+        </div>
+      </div>
+    </fieldset>
+
+    <footer>
+      <span class="hint">Saved in this browser.</span>
+      <button type="button" id="settings-reset" class="link">Reset</button>
+      <button value="close" class="primary">Done</button>
+    </footer>
+  </form>
+</dialog>
 
 <script src="/static/vendor/maplibre/maplibre-gl.js"></script>
 <script src="/static/glyphs.js"></script>
