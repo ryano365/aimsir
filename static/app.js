@@ -617,9 +617,13 @@
       $("#now-glyph").innerHTML = Glyphs.glyph(st.symbol);
       let radarTxt = "";
       if (rd?.covered) radarTxt = rd.rate_mmh > 0 ? `radar shows ${rd.rate_mmh.toFixed(1)} mm/h here` : "radar shows no rain here";
-      $("#now-desc").textContent = [st.weather, radarTxt].filter(Boolean).join(" · ");
+      const fills = Object.entries(st.filled || {});
+      const fromTxt = fills.length
+        ? `${fills.map(([g]) => g).join(", ")} from ${[...new Set(fills.map(([, n]) => n))].join(", ")}` : "";
+      $("#now-desc").textContent = [st.weather, radarTxt, fromTxt].filter(Boolean).join(" · ");
       $("#now-grid").innerHTML = [
-        cell("Wind", `${st.wind_name || ""} ${wStr(st.wind_kmh)}`, wUnit()),
+        cell("Wind", st.wind_kmh == null ? "–" : `${st.wind_name && st.wind_name !== "Calm" ? st.wind_name + " " : ""}${wStr(st.wind_kmh)}`,
+             st.wind_kmh == null ? "" : wUnit()),
         cell("Humidity", st.humidity != null ? Math.round(st.humidity) : "–", "%"),
         cell("Pressure", st.pressure != null ? Math.round(st.pressure) : "–", "hPa"),
         cell("Rain, station", st.rain_mmh != null ? st.rain_mmh.toFixed(1) : "–", "mm/h"),

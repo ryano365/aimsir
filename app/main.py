@@ -535,13 +535,28 @@ async def live(lat: float = Query(ge=-90, le=90), lon: float = Query(ge=-180, le
     out: dict = {"station": None, "radar": None}
     try:
         obs = await observations(app.state.http)
-        best = None
-        for st in obs["stations"]:
-            d = float(radar.great_circle(lat, lon, st["lat"], st["lon"])[0]) / 1000
-            if st["temp"] is not None and (best is None or d < best[0]):
-                best = (d, st)
+        ranked = sorted(
+            ((float(radar.great_circle(lat, lon, st["lat"], st["lon"])[0]) / 1000, st) for st in obs["stations"]),
+            key=lambda x: x[0])
+        best = next(((d, st) for d, st in ranked if st["temp"] is not None), None)
         if best:
-            out["station"] = {**best[1], "distance_km": round(best[0]), "time": obs["time"]}
+            d0, st0 = best
+            station = {**st0, "distance_km": round(d0), "time": obs["time"], "filled": {}}
+            # Fill gaps (Met reports some sensors as -99) from the next-nearest station within 30 km.
+            groups = {"wind": ("wind_kmh", "wind_dir", "wind_name"), "weather": ("weather", "symbol"),
+                      "humidity": ("humidity",), "pressure": ("pressure",), "rain": ("rain_mmh",)}
+            for g, keys in groups.items():
+                if station[keys[0]] not in (None, ""):
+                    continue
+                for d, other in ranked:
+                    if other is st0 or d > 30:
+                        continue
+                    if other[keys[0]] not in (None, ""):
+                        for k in keys:
+                            station[k] = other[k]
+                        station["filled"][g] = other["label"]
+                        break
+            out["station"] = station
     except (httpx.HTTPError, ValueError) as e:
         out["station_error"] = str(e)
     idx = _read_json(RADAR_OUT / "index.json", {})

@@ -130,11 +130,23 @@ COMPASS = {"N": 0, "NNE": 22.5, "NE": 45, "ENE": 67.5, "E": 90, "ESE": 112.5, "S
            "S": 180, "SSW": 202.5, "SW": 225, "WSW": 247.5, "W": 270, "WNW": 292.5, "NW": 315, "NNW": 337.5}
 
 
-def _num(el):
+MISSING = {-99.0, -999.0, -9999.0}
+
+
+def _num(el, lo: float | None = None, hi: float | None = None):
+    """Station value, or None if missing. Met marks gaps with -99 (and '--' for text)."""
     try:
-        return float(el.text.strip())
+        v = float(el.text.strip())
     except (AttributeError, ValueError):
         return None
+    if v in MISSING or (lo is not None and v < lo) or (hi is not None and v > hi):
+        return None
+    return v
+
+
+def _text(st, tag: str) -> str:
+    t = (st.findtext(tag) or "").strip()
+    return "" if not t or set(t) <= {"-"} or t in ("-99", "n/a", "N/A") else t
 
 
 def _obs_symbol(symbol: str, text: str) -> str:
@@ -178,20 +190,25 @@ async def observations(client: httpx.AsyncClient) -> dict:
         name = st.get("name", "").strip()
         if name not in STATIONS:
             continue
-        wd = (st.findtext("wind_direction") or "").strip().upper()
-        kts = _num(st.find("wind_speed"))
+        wd = _text(st, "wind_direction").upper()
+        if wd not in COMPASS and wd not in ("CALM", "VRB"):
+            wd = ""
+        kts = _num(st.find("wind_speed"), 0, 200)
+        if wd == "CALM":
+            kts = 0.0 if kts is None else kts
+        weather = _text(st, "weather_text")
         out["stations"].append({
             "name": name, "label": LABELS.get(name, name),
             "lat": STATIONS[name][0], "lon": STATIONS[name][1],
-            "temp": _num(st.find("temp")),
-            "weather": (st.findtext("weather_text") or "").strip().capitalize(),
-            "symbol": _obs_symbol(st.findtext("symbol") or "", st.findtext("weather_text") or ""),
+            "temp": _num(st.find("temp"), -50, 50),
+            "weather": weather.capitalize(),
+            "symbol": _obs_symbol(_text(st, "symbol"), weather),
             "wind_kmh": None if kts is None else round(kts * KTS_TO_KMH),
             "wind_dir": COMPASS.get(wd),
-            "wind_name": wd or None,
-            "humidity": _num(st.find("humidity")),
-            "rain_mmh": _num(st.find("rainfall")),
-            "pressure": _num(st.find("pressure")),
+            "wind_name": {"CALM": "Calm", "VRB": "Variable"}.get(wd, wd) or None,
+            "humidity": _num(st.find("humidity"), 0, 100),
+            "rain_mmh": _num(st.find("rainfall"), 0, 300),
+            "pressure": _num(st.find("pressure"), 850, 1100),
         })
     _obs_cache = (time.time(), out)
     return out
